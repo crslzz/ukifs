@@ -17,7 +17,7 @@ This program tests the `pe_verify_signature()` function from `pe_parser_posix.c`
 Build the test program natively for Linux:
 
 ```bash
-make test-verify
+UKIBOOT=/path/to/ukiboot QNX_SDP=/path/to/qnx/sdp make test-verify
 ```
 
 This creates a `test_verify` executable (66KB, x86-64 Linux binary).

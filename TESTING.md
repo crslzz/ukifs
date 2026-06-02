@@ -21,7 +21,7 @@ Computes the actual UKI size from PE/COFF headers, identifying extra padding.
 
 **Example:**
 ```bash
-$ ./test_size ukiboot_a_signed.img
+$ ./test_size ukiboot_signed.img
 Expected UKI size: 66324224 bytes (63.25 MB)
 Actual file size:  134217728 bytes (128.00 MB)
 Extra padding:     67893504 bytes (64.75 MB)
@@ -47,79 +47,31 @@ Verifies UKI Authenticode signatures using X.509 certificates.
 
 **Example (Standard Mode):**
 ```bash
-$ ./test_verify ukiboot_a_signed.img rootCA.crt
+$ ./test_verify ukiboot_signed.img rootCA.crt
 ✓ SIGNATURE VERIFICATION PASSED
 ```
 
 **Example (Ignore Padding):**
 ```bash
-$ ./test_verify -i ukiboot_a_signed.img rootCA.crt
+$ ./test_verify -i ukiboot_signed.img rootCA.crt
 Computed UKI size: 66324224 bytes (63.25 MB)
 Extra padding: 67893504 bytes (64.75 MB, 50.6% of file)
 ✓ SIGNATURE VERIFICATION PASSED
 ```
-
-## Common Library
-
-### uki_size.c / uki_size.h
-
-Shared library for UKI size computation used by both test programs.
-
-**API:**
-```c
-typedef struct {
-    uint32_t headers_end;         /* End of PE headers */
-    uint32_t last_section_end;    /* End of last section */
-    uint32_t cert_table_offset;   /* Certificate offset (0 if none) */
-    uint32_t cert_table_size;     /* Certificate size (0 if none) */
-    uint32_t cert_table_end;      /* Certificate end (0 if none) */
-    uint32_t expected_size;       /* Computed UKI size */
-    uint16_t num_sections;        /* Number of sections */
-} uki_size_info_t;
-
-bool uki_compute_size(int fd, uki_size_info_t *info);
-```
-
-## Test Files
-
-### ukiboot_a_signed.img
-
-Signed UKI file for testing signature verification.
-
-**Properties:**
-- Actual file size: 134217728 bytes (128.00 MB)
-- UKI data size: 66324224 bytes (63.25 MB)
-- Certificate: 1792 bytes at offset 66322432
-- Extra padding: 67893504 bytes (50.6% of file)
-- Signed with: rootCA.crt
-
-### ../ukiboot_a.img
-
-Unsigned UKI file (same content, no signature).
-
-**Properties:**
-- Actual file size: 134217728 bytes (128.00 MB)
-- UKI data size: 64630272 bytes (61.64 MB)
-- No certificate table
-- Extra padding: 69587456 bytes (51.8% of file)
-
-### rootCA.crt
-
-X.509 root certificate for verifying ukiboot_a_signed.img.
 
 ## Building
 
 Build all test programs:
 
 ```bash
-make test
+UKIBOOT=/path/to/ukiboot QNX_SDP=/path/to/qnx/sdp make tests
 ```
 
 Build individually:
 
 ```bash
-make test-size    # UKI size analysis
-make test-verify  # Signature verification
+UKIBOOT=/path/to/ukiboot QNX_SDP=/path/to/qnx/sdp make test-size    # UKI size analysis
+UKIBOOT=/path/to/ukiboot QNX_SDP=/path/to/qnx/sdp make test-verify  # Signature verification
 ```
 
 ## Running Tests
@@ -127,11 +79,11 @@ make test-verify  # Signature verification
 ### Quick Test
 ```bash
 # Size analysis
-./test_size ukiboot_a_signed.img
+./test_size ukiboot_signed.img
 
 # Signature verification (both modes)
-./test_verify ukiboot_a_signed.img rootCA.crt
-./test_verify -i ukiboot_a_signed.img rootCA.crt
+./test_verify ukiboot_signed.img rootCA.crt
+./test_verify -i ukiboot_signed.img rootCA.crt
 ```
 
 ### Demo Scripts

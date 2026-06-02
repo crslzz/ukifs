@@ -17,7 +17,7 @@ This program helps you:
 Build the test program natively for Linux:
 
 ```bash
-make test-size
+UKIBOOT=/path/to/ukiboot QNX_SDP=/path/to/qnx/sdp make test-size
 ```
 
 This creates a `test_size` executable (~25KB, x86-64 Linux binary) with no external dependencies beyond libc.
