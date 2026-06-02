@@ -10,7 +10,7 @@ This program mounts a UKI as a read-only filesystem. This allows passing individ
 
 ## Building
 
-This program depends on the 'ukiboot' project at https://gitlab.com/CentOS/automotive/src/ukiboot.
+This program depends on the `ukiboot` project at https://gitlab.com/CentOS/automotive/src/ukiboot.
 
 Build the program using the QNX Software Development Platform (QNX SDP) using:
 
@@ -41,7 +41,7 @@ This creates `ukifs` (x86_64) and `ukifs.aarch64` executables for QNX.
 ./ukifs -c /etc/uki-cert.pem /boot/ukiboot.efi /mnt/uki
 
 
-# ./ukifs /boot/ukiboot.efi /mnt/uki
+./ukifs /boot/ukiboot.efi /mnt/uki
 [INFO] Opening UKI file: /boot/ukiboot.efi
 [INFO] UKI file size: 134217728 bytes
 [INFO] No certificate provided, signature verification skipped
@@ -49,7 +49,7 @@ This creates `ukifs` (x86_64) and `ukifs.aarch64` executables for QNX.
 [INFO] Parsed 11 sections from UKI file
 [INFO] Attaching resource manager at /mnt/uki
 
-# ls -l /mnt/uki
+ls -l /mnt/uki
 total 126228
 -r--r--r--   1 root      root            325 May 13  2026 cmdline
 -r--r--r--   1 root      root            152 May 13  2026 data
@@ -63,6 +63,6 @@ total 126228
 -r--r--r--   1 root      root          57368 May 13  2026 text
 -r--r--r--   1 root      root             25 May 13  2026 uname
 
-# cat /mnt/uki/uname
+cat /mnt/uki/uname
 6.12.0-210.el10iv.aarch64
 ```
