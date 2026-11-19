@@ -132,6 +132,7 @@ static void signal_handler(int signo) {
 /* Long-only option values */
 #define OPT_BOOTCTL 256
 #define OPT_NO_MMAP 257
+#define OPT_EAGER_MAP 258
 
 static void usage(const char *argv0) {
     fprintf(stderr, "Usage: %s [options] <uki-file|ukiboot-image> <mount-point>\n", argv0);
@@ -160,6 +161,10 @@ static void usage(const char *argv0) {
     fprintf(stderr, "                      instead of the one of the disk image (implies --slot auto)\n");
     fprintf(stderr, "      --no-mmap       Never map the UKI, always read it with pread()\n");
     fprintf(stderr, "                      (automatic when the source cannot be mapped)\n");
+    fprintf(stderr, "      --eager-map     Populate the mapping while mounting instead of as\n");
+    fprintf(stderr, "                      the UKI is read: mounting takes as long as reading\n");
+    fprintf(stderr, "                      the whole UKI, but reads never wait for the device\n");
+    fprintf(stderr, "                      afterwards and cannot fail on a memory shortage\n");
     fprintf(stderr, "  -h, --help          Show this help\n");
     fprintf(stderr, "\n");
     fprintf(stderr, "Examples:\n");
@@ -188,7 +193,8 @@ static int parse_arguments(int argc, char *argv[], uki_context_t *ctx) {
 	{"slot-a",  no_argument,       NULL, 'A'},
 	{"slot-b",  no_argument,       NULL, 'B'},
 	{"bootctl", required_argument, NULL, OPT_BOOTCTL},
-	{"no-mmap", no_argument,       NULL, OPT_NO_MMAP},
+	{"no-mmap",  no_argument,      NULL, OPT_NO_MMAP},
+	{"eager-map", no_argument,     NULL, OPT_EAGER_MAP},
 	{"help",    no_argument,       NULL, 'h'},
 	{NULL,      0,                 NULL, 0},
     };
@@ -197,6 +203,7 @@ static int parse_arguments(int argc, char *argv[], uki_context_t *ctx) {
     ctx->cert_path = NULL;
     ctx->bootctl_path = NULL;
     ctx->no_mmap = false;
+    ctx->eager_map = false;
     ctx->slot_sel = UKI_SLOT_SEL_NONE;
     ctx->slot = -1;
 
@@ -242,6 +249,9 @@ static int parse_arguments(int argc, char *argv[], uki_context_t *ctx) {
 	    break;
 	case OPT_NO_MMAP:
 	    ctx->no_mmap = true;
+	    break;
+	case OPT_EAGER_MAP:
+	    ctx->eager_map = true;
 	    break;
 	case 'h':
 	    usage(argv[0]);
@@ -377,27 +387,37 @@ static void map_uki(uki_context_t *ctx) {
 
     ctx->map_len = length + delta;
 
-    /* MAP_LAZY leaves the pages to be faulted in when they are read.
-     * Without it, a driver may populate the whole mapping up front:
-     * on an i.MX8QXP SD card that is 8.3 s for a 128 MB slot, paid
-     * before the filesystem answers its first request. */
+    /*
+     * The pages are faulted in as they are read. A driver may
+     * otherwise populate the whole mapping inside mmap(): on an
+     * i.MX8QXP SD card that is 4.2 s for a 62 MB UKI, paid before the
+     * filesystem answers anything, and paid in full even by a client
+     * that only reads .cmdline. Reading the whole UKI costs the same
+     * either way, and pages stay resident once read, so the lazy
+     * mapping is never slower overall.
+     *
+     * --eager-map populates at mount instead, for a caller that wants
+     * reads not to wait for the device afterwards, or that wants a
+     * memory shortage to be reported here as a failed mmap() falling
+     * back to pread(), rather than as a SIGBUS while serving a read.
+     */
     int flags = MAP_SHARED;
 
 #ifdef MAP_LAZY
-    flags |= MAP_LAZY;
+    if (!ctx->eager_map) {
+	flags |= MAP_LAZY;
+    }
 #endif
 
     ctx->map_addr = mmap(NULL, ctx->map_len, PROT_READ, flags,
 			 ctx->uki_fd, map_offset);
 
-#ifdef MAP_LAZY
-    if (ctx->map_addr == MAP_FAILED) {
-	DEBUG_LOG("Lazy mapping refused (%s), trying without MAP_LAZY",
+    if (ctx->map_addr == MAP_FAILED && flags != MAP_SHARED) {
+	DEBUG_LOG("Lazy mapping refused (%s), populating it instead",
 		  strerror(errno));
 	ctx->map_addr = mmap(NULL, ctx->map_len, PROT_READ, MAP_SHARED,
 			     ctx->uki_fd, map_offset);
     }
-#endif
 
     if (ctx->map_addr == MAP_FAILED) {
 	INFO_LOG("Cannot map '%s' (%s), reading the UKI with pread() instead",
@@ -409,7 +429,8 @@ static void map_uki(uki_context_t *ctx) {
 
     ctx->mmap_base = (char *)ctx->map_addr + delta;
 
-    INFO_LOG("Mapped %zu bytes of the UKI at %p", length, ctx->mmap_base);
+    INFO_LOG("Mapped %zu bytes of the UKI at %p (%s)", length, ctx->mmap_base,
+	     ctx->eager_map ? "populated" : "lazily");
 }
 
 /*

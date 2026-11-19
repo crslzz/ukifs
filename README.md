@@ -49,6 +49,7 @@ slots](#ukiboot-ab-slots) below).
 -  `-B`, `--slot-b`         - Same as `--slot b`
 -  `--bootctl <path>`       - Standalone `ukibootctl` partition to use for `--slot auto`
 -  `--no-mmap`              - Never map the UKI, always read it with `pread()`
+-  `--eager-map`            - Populate the mapping at mount instead of as the UKI is read
 -  `-h`, `--help`           - Show this help
 
 ### Examples:
@@ -239,32 +240,37 @@ and the mapping is kept as small and as lazy as possible:
   been parsed, which is why the mapping is created after parsing.
 - **The mapping is lazy** (`MAP_LAZY` where available), so pages are read when
   they are touched instead of being populated at mount time. Some drivers
-  populate the whole mapping otherwise: on the i.MX8QXP SD card that is 8.3 s
-  for a 128 MB slot, paid before the filesystem answers its first request.
+  populate the whole mapping otherwise, which a client reading only
+  `.cmdline` would pay in full. Pages stay resident once read, so the lazy
+  mapping is never slower overall. `--eager-map` populates at mount instead,
+  for a caller that would rather have reads never wait for the device, or
+  that wants a memory shortage reported as a failed `mmap()` falling back to
+  `pread()` rather than as a `SIGBUS` while a read is being served.
 - **Reads from the mapping are zero-copy** for `ukifs`: the data is handed to
   the framework as a pointer into the mapping, and the kernel copies it
   straight into the buffer of the client when replying. That single copy is
   inherent to message passing.
 - **Without a mapping**, the data is read into a 64 KB scratch buffer, one per
   thread and allocated once, and streamed to the client in as many chunks as
-  needed with `resmgr_msgwrite()`. A read of any size is answered in full,
-  nothing is allocated per request, and the second copy is the price of not
-  having a mapping.
+  needed with `resmgr_msgwrite()`. A read of any size is answered in full and
+  nothing is allocated per request, but nothing is cached either: every read
+  goes to the device.
 
-Measured on an i.MX8QXP with the AutoSD image in `/dev/sd0t131` (SD card
-reading at roughly 16 MB/s), mounting the active slot and reading the kernel
-and the initrd once:
+Measured on an i.MX8QXP with the AutoSD image in `/dev/sd0t131`, an SD card
+reading at roughly 17 MB/s whatever the request size. Each figure is the
+median of three runs:
 
-| Strategy                          | Mount  | 53 MB kernel | 11 MB initrd | Total  |
-|-----------------------------------|--------|--------------|--------------|--------|
-| Eager mapping of the whole slot   | 8.31 s | 0.06 s       | 0.02 s       | 8.39 s |
-| Lazy mapping of the UKI extent    | 0.50 s | 3.07 s       | 0.62 s       | 4.19 s |
-| `--no-mmap`                       | 0.06 s | 5.55 s       | 1.13 s       | 6.74 s |
+| Scenario                                   | Lazy (default) | `--eager-map` | `--no-mmap` |
+|--------------------------------------------|---------------|---------------|-------------|
+| Mount                                       | 0.50 s        | 4.22 s        | 0.06 s      |
+| Mount + read the 53 MB kernel and 11 MB initrd | 4.15 s     | 4.29 s        | 4.05 s      |
+| Mount + read `.cmdline`, `.uname`, `.osrel` | 0.49 s        | 4.22 s        | 0.06 s      |
+| Re-read the kernel, same mount              | 0.07 s        | 0.07 s        | 3.35 s      |
 
-A lazy mapping takes its physical memory as it is read, so a client reading a
-section can get `SIGBUS` if memory runs out at that point, where an eager
-mapping would have failed at mount. `--no-mmap` never faults and is the
-option to use when that matters more than throughput.
+Reading everything once costs the same whatever the strategy: the device sets
+the pace. The differences are in when that time is spent, and in what happens
+afterwards, as a mapping keeps what it has read while `pread()` goes back to
+the device every time.
 
 Clients that call `mmap()` on a section do not get a zero-copy mapping: a file
 can only be mapped from a page boundary of the underlying object, and the

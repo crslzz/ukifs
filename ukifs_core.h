@@ -57,6 +57,7 @@ typedef struct uki_context {
     size_t uki_extent;             /* Bytes actually covered by its sections */
     int uki_fd;                    /* File descriptor for UKI file/disk image */
     bool no_mmap;                  /* Never mmap, always read with pread() */
+    bool eager_map;                /* Populate the mapping at mount time */
     mode_t perm;                   /* File permissions */
 
     struct stat src_stat;          /* Stat of the source, timestamps fixed up
