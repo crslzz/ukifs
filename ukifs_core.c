@@ -368,12 +368,37 @@ static void map_uki(uki_context_t *ctx) {
 	page_size = 4096;
     }
 
+    /* Map what the sections cover, not the whole slot: the padding
+     * after the UKI is never read, and mapping it is not free */
+    size_t length = ctx->uki_extent ? ctx->uki_extent : ctx->uki_size;
+
     off_t map_offset = ctx->uki_offset & ~((off_t)page_size - 1);
     size_t delta = (size_t)(ctx->uki_offset - map_offset);
 
-    ctx->map_len = ctx->uki_size + delta;
-    ctx->map_addr = mmap(NULL, ctx->map_len, PROT_READ, MAP_SHARED,
+    ctx->map_len = length + delta;
+
+    /* MAP_LAZY leaves the pages to be faulted in when they are read.
+     * Without it, a driver may populate the whole mapping up front:
+     * on an i.MX8QXP SD card that is 8.3 s for a 128 MB slot, paid
+     * before the filesystem answers its first request. */
+    int flags = MAP_SHARED;
+
+#ifdef MAP_LAZY
+    flags |= MAP_LAZY;
+#endif
+
+    ctx->map_addr = mmap(NULL, ctx->map_len, PROT_READ, flags,
 			 ctx->uki_fd, map_offset);
+
+#ifdef MAP_LAZY
+    if (ctx->map_addr == MAP_FAILED) {
+	DEBUG_LOG("Lazy mapping refused (%s), trying without MAP_LAZY",
+		  strerror(errno));
+	ctx->map_addr = mmap(NULL, ctx->map_len, PROT_READ, MAP_SHARED,
+			     ctx->uki_fd, map_offset);
+    }
+#endif
+
     if (ctx->map_addr == MAP_FAILED) {
 	INFO_LOG("Cannot map '%s' (%s), reading the UKI with pread() instead",
 		 ctx->uki_path, strerror(errno));
@@ -384,9 +409,8 @@ static void map_uki(uki_context_t *ctx) {
 
     ctx->mmap_base = (char *)ctx->map_addr + delta;
 
-    INFO_LOG("Mapped UKI at %p (%zu bytes)", ctx->mmap_base, ctx->uki_size);
+    INFO_LOG("Mapped %zu bytes of the UKI at %p", length, ctx->mmap_base);
 }
-
 
 /*
  * Shut a running filesystem down.
@@ -567,8 +591,6 @@ int main(int argc, char *argv[]) {
         return EXIT_FAILURE;
     }
 
-    /* Map the UKI, or fall back to reading it with pread() */
-    map_uki(ctx);
 
     /* Allocate hash table */
     ctx->hash_table_size = HASH_TABLE_SIZE;
@@ -629,6 +651,10 @@ int main(int argc, char *argv[]) {
         free(ctx);
         return EXIT_FAILURE;
     }
+
+    /* The sections are known: map exactly what they cover, or fall
+     * back to reading the UKI with pread() */
+    map_uki(ctx);
 
     /* Initialize QNX iofunc structures */
     iofunc_func_init(_RESMGR_CONNECT_NFUNCS, &connect_funcs,

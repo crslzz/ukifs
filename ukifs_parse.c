@@ -117,6 +117,7 @@ int uki_parse_sections(uki_context_t *ctx) {
 
     /* Process each section */
     uint32_t valid_sections = 0;
+    size_t extent = 0;
     for (uint32_t i = 0; i < num_sections; i++) {
         uki_entry_t *entry = create_uki_entry(&sections[i], file_stat, ctx);
         if (!entry) {
@@ -144,12 +145,18 @@ int uki_parse_sections(uki_context_t *ctx) {
             continue;
         }
 
+        if ((size_t)entry->file_offset + entry->size > extent) {
+            extent = (size_t)entry->file_offset + entry->size;
+        }
+
         valid_sections++;
     }
 
     free(sections);
 
     ctx->num_sections = valid_sections;
+    ctx->uki_extent = extent;
+    DEBUG_VAL("uki_extent", extent);
     DEBUG_VAL("valid_sections", valid_sections);
 
     if (valid_sections == 0) {

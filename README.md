@@ -206,13 +206,10 @@ A few things are handled specifically for block devices:
   driver. On an i.MX8QXP target with `devb-sdmmc`, mapping a partition works
   and reads are served straight from the mapping; other drivers reject
   `mmap()`. `ukifs` tries to map, logs the reason when it cannot, and then
-  serves reads with `pread()` into a temporary buffer instead of handing out
-  pointers into a mapping. This is transparent for clients; only the zero-copy
-  optimization is lost. `--no-mmap` forces that mode, which is also useful to
-  compare both paths on the same source.
-- **Reads are bounded**: in that mode a single read is answered with at most
-  1 MB, so a client issuing a huge read gets a short read (which is allowed)
-  rather than making the driver allocate a huge buffer.
+  serves reads with `pread()` instead of handing out pointers into a mapping.
+  This is transparent for clients; only the zero-copy optimization is lost.
+  `--no-mmap` forces that mode, which is also useful to compare both paths on
+  the same source.
 
 ```bash
 $ ukifs -v --slot auto /dev/sd0t131 /mnt/uki
@@ -230,6 +227,50 @@ $ ukifs -v --slot auto /dev/sd0t131 /mnt/uki
 [INFO] Parsed 11 sections from UKI file
 [INFO] Attaching resource manager at /mnt/uki
 ```
+
+## How the UKI is read
+
+Reads are served with as few copies as the resource manager interface allows,
+and the mapping is kept as small and as lazy as possible:
+
+- **Only what the sections cover is mapped**, not the whole slot. On the
+  AutoSD image that is 62 MB instead of a 128 MB partition, as the rest is
+  padding that is never read. The extent is known once the PE sections have
+  been parsed, which is why the mapping is created after parsing.
+- **The mapping is lazy** (`MAP_LAZY` where available), so pages are read when
+  they are touched instead of being populated at mount time. Some drivers
+  populate the whole mapping otherwise: on the i.MX8QXP SD card that is 8.3 s
+  for a 128 MB slot, paid before the filesystem answers its first request.
+- **Reads from the mapping are zero-copy** for `ukifs`: the data is handed to
+  the framework as a pointer into the mapping, and the kernel copies it
+  straight into the buffer of the client when replying. That single copy is
+  inherent to message passing.
+- **Without a mapping**, the data is read into a 64 KB scratch buffer, one per
+  thread and allocated once, and streamed to the client in as many chunks as
+  needed with `resmgr_msgwrite()`. A read of any size is answered in full,
+  nothing is allocated per request, and the second copy is the price of not
+  having a mapping.
+
+Measured on an i.MX8QXP with the AutoSD image in `/dev/sd0t131` (SD card
+reading at roughly 16 MB/s), mounting the active slot and reading the kernel
+and the initrd once:
+
+| Strategy                          | Mount  | 53 MB kernel | 11 MB initrd | Total  |
+|-----------------------------------|--------|--------------|--------------|--------|
+| Eager mapping of the whole slot   | 8.31 s | 0.06 s       | 0.02 s       | 8.39 s |
+| Lazy mapping of the UKI extent    | 0.50 s | 3.07 s       | 0.62 s       | 4.19 s |
+| `--no-mmap`                       | 0.06 s | 5.55 s       | 1.13 s       | 6.74 s |
+
+A lazy mapping takes its physical memory as it is read, so a client reading a
+section can get `SIGBUS` if memory runs out at that point, where an eager
+mapping would have failed at mount. `--no-mmap` never faults and is the
+option to use when that matters more than throughput.
+
+Clients that call `mmap()` on a section do not get a zero-copy mapping: a file
+can only be mapped from a page boundary of the underlying object, and the
+sections of a UKI are 512 byte aligned, so `.linux` and `.initrd` sit inside a
+page. Their `mmap()` is satisfied by the memory manager through ordinary
+reads, at the same cost as `read()`.
 
 ## Extracting a UKI on Linux (ukiextract)
 
