@@ -100,7 +100,7 @@ int main(int argc, char *argv[]) {
     if (ignore_padding) {
         /* Compute UKI size */
         uki_size_info_t size_info;
-        if (!uki_compute_size(fd, &size_info)) {
+        if (!uki_compute_size(fd, 0, &size_info)) {
             fprintf(stderr, "ERROR: Failed to compute UKI size\n");
             close(fd);
             return EXIT_FAILURE;

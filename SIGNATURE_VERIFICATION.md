@@ -2,23 +2,27 @@
 
 ## Overview
 
-The QNX UKI filesystem driver (`ukifs`) now includes intelligent signature verification that automatically handles padded UKI files. When a UKI file has been padded to a fixed size after signing, the driver automatically detects the padding and verifies only the actual UKI data.
+The QNX UKI filesystem driver (`ukifs`) verifies the Authenticode signature of a UKI before exposing its sections. Verification works whether the UKI is a plain file, a file padded to a fixed size, or the content of a `ukiboot_a` / `ukiboot_b` slot of a ukiboot disk image.
 
 ## Feature Summary
 
-### What's New
+### How It Works
 
-**Automatic Padding Detection:**
-- Computes actual UKI size from PE headers (including certificate table)
-- Detects if file has extra padding beyond the UKI data
-- Creates temporary file with only UKI data for verification
-- Verifies signature against the truncated file (excluding padding)
+Verification is done by ukiboot's PE parser (`pe_verify_signature()`), which is given the offset of the UKI in the file. The Authenticode digest it computes covers:
 
-**Transparent Operation:**
+- the PE headers (minus the `CheckSum` field and the Security Directory entry),
+- the raw data of every section,
+- the gap between the last section and the certificate table.
+
+Nothing beyond the certificate table is part of the digest, so **any padding after the UKI is ignored**, and the UKI does not have to start at offset 0 of the file.
+
+**Transparent operation:**
 - No command-line options required
 - Works automatically when `-c <cert.pem>` is specified
-- Falls back to full-file verification if no padding detected
+- Applies identically to a plain UKI file and to a ukiboot slot
 - Informative logging at INFO level shows what's happening
+
+Before verifying, the driver computes the size of the UKI from the PE headers and compares it with the space available (file size, or size of the slot partition). A UKI that does not fit is rejected as truncated, and left-over space is reported as padding.
 
 ### Why This Matters
 
@@ -28,7 +32,7 @@ UKI files are often padded to fixed sizes for:
 - **Storage devices** - Block device alignment requirements
 - **Build processes** - Round to power-of-2 sizes
 
-When padding is added **after** signing, the signature only covers the original UKI data, not the padding. Without this feature, signature verification would fail on such files.
+A ukiboot slot partition is a case of this: the UKI is written at the start of a fixed-size partition, and the rest of the partition keeps whatever it contained before. When padding is added **after** signing, the signature only covers the original UKI data, not the padding.
 
 ### Example: Padded UKI
 
@@ -42,15 +46,13 @@ Extra padding:      67893504 bytes (64.75 MB, 50.6%)
 
 Driver behavior:
 ```
+[INFO] UKI size: 66324224 bytes (134217728 bytes available)
+[INFO] Ignoring 67893504 bytes of padding after the UKI (50.6%)
 [INFO] Verifying UKI signature with certificate: rootCA.crt
-[INFO] File size: 134217728 bytes, UKI size: 66324224 bytes
-[INFO] Detected 67893504 bytes of padding (50.6% of file)
-[INFO] Creating temporary file for signature verification (excluding padding)
-[INFO] Verifying signature against UKI data only (66324224 bytes)
 [VERBOSE] Signature digest algorithm: SHA256
 [VERBOSE] Authenticode hash matches
 [VERBOSE] Signer certificate trusted
-[INFO] ✓ UKI signature verified successfully
+[INFO] UKI signature verified successfully
 ```
 
 ## Usage
@@ -66,6 +68,9 @@ Driver behavior:
 
 # With debug logging (shows full verification details)
 ./ukifs -d 3 -c rootCA.crt ukiboot_a_signed.img /mnt/uki
+
+# Verify the UKI of the active slot of a ukiboot disk image
+./ukifs -v -c rootCA.crt --slot auto /dev/hd0 /mnt/uki
 ```
 
 ### Behavior by File Type
@@ -79,15 +84,19 @@ Driver behavior:
 **Signed UKI without padding:**
 ```bash
 ./ukifs -c cert.pem signed.efi /mnt/uki
-# Verifies full file, no temporary file needed
+# Verifies headers, sections and certificate table
 ```
 
 **Signed UKI with padding:**
 ```bash
 ./ukifs -c cert.pem padded.efi /mnt/uki
-# Automatically detects padding
-# Creates temp file with UKI data only
-# Verifies signature against truncated file
+# Reports the padding, which is not part of the digest
+```
+
+**Signed UKI in a ukiboot slot:**
+```bash
+./ukifs -c cert.pem --slot b ukiboot.img /mnt/uki
+# Verifies the UKI where it sits in the slot partition
 ```
 
 **Invalid signature:**
@@ -113,9 +122,9 @@ ERROR: UKI signature verification failed!
 
 **Level 2 (Info, `-v`):** Verification status
 ```
-[INFO] File size: 134217728 bytes, UKI size: 66324224 bytes
-[INFO] Detected 67893504 bytes of padding (50.6% of file)
-[INFO] ✓ UKI signature verified successfully
+[INFO] UKI size: 66324224 bytes (134217728 bytes available)
+[INFO] Ignoring 67893504 bytes of padding after the UKI (50.6%)
+[INFO] UKI signature verified successfully
 ```
 
 **Level 3 (Debug, `-d 3`):** Full details
@@ -137,11 +146,19 @@ Linux test program with same functionality:
 # Standard mode (verify full file)
 ./test_verify ukiboot_a_signed.img rootCA.crt
 
-# Ignore padding mode (same as driver behavior)
+# Ignore padding mode (verify a copy stripped of its padding)
 ./test_verify -i ukiboot_a_signed.img rootCA.crt
 ```
 
 Both modes should pass for properly padded signed UKIs.
+
+### test_slot
+
+Verify a UKI where it sits in a slot of a ukiboot disk image:
+
+```bash
+./test_slot --cert rootCA.crt ukiboot.img auto
+```
 
 ### test_size
 
@@ -168,29 +185,25 @@ Output shows:
 
 **Driver behavior:**
 ```
-[INFO] Detected 65 MB of padding (50.8% of file)
-[INFO] Verifying signature against UKI data only (66324224 bytes)
-[INFO] ✓ UKI signature verified successfully
+[INFO] UKI size: 66324224 bytes (134217728 bytes available)
+[INFO] Ignoring 67893504 bytes of padding after the UKI (50.6%)
+[INFO] UKI signature verified successfully
 ```
 
 **Result:** Mount succeeds, signature valid ✓
 
-### Scenario 2: Build Artifact
+### Scenario 2: ukiboot Slot
 
 **Setup:**
-- Build process generates 65 MB UKI
-- Build system rounds to 128 MB for storage
-- UKI was signed before padding added
+- UKI signed, then written at the start of the `ukiboot_b` partition
+- Partition is larger than the UKI and keeps older data after it
 
-**Without this feature:**
+**Driver behavior:**
 ```
-ERROR: UKI signature verification failed!
-```
-
-**With this feature:**
-```
-[INFO] Detected 63 MB of padding (49.2% of file)
-[INFO] ✓ UKI signature verified successfully
+[INFO] Selected ukiboot slot: b
+[INFO] ukiboot slot b: offset 2097152, size 1048576 bytes
+[INFO] UKI size: 5144 bytes (1043432 bytes available)
+[INFO] UKI signature verified successfully
 ```
 
 **Result:** Mount succeeds ✓
@@ -203,11 +216,11 @@ ERROR: UKI signature verification failed!
 
 **Driver behavior:**
 ```
-[INFO] File size: 66324224 bytes, UKI size: 66324224 bytes
-[INFO] ✓ UKI signature verified successfully
+[INFO] UKI size: 66324224 bytes (66324224 bytes available)
+[INFO] UKI signature verified successfully
 ```
 
-**Result:** No temporary file created, direct verification ✓
+**Result:** Direct verification ✓
 
 ## Security Considerations
 
@@ -223,6 +236,7 @@ ERROR: UKI signature verification failed!
 ✗ **Does NOT validate padding** - Padding is not signed, can be modified
 ✗ **Does NOT verify file size** - Only content up to certificate table is checked
 ✗ **Does NOT prevent padding removal** - Attacker could remove padding (but signature still valid)
+✗ **Does NOT authenticate the slot selection** - The `ukibootctl` content is CRC32 protected, not signed
 
 ### Security Properties
 
@@ -242,6 +256,7 @@ ERROR: UKI signature verification failed!
 2. Use padding only for alignment/pre-allocation
 3. Don't store sensitive data in padding region
 4. Verify certificate against trusted root CA
+5. Verify the signature of whichever slot is mounted, including with `--slot auto`
 
 ## Troubleshooting
 
@@ -257,29 +272,23 @@ ERROR: UKI signature verification failed!
 # Test verification manually
 ./test_verify ukiboot_a_signed.img rootCA.crt
 
-# Try with padding ignored
-./test_verify -i ukiboot_a_signed.img rootCA.crt
+# Test verification of a UKI stored in a slot
+./test_slot --cert rootCA.crt ukiboot.img auto
 ```
 
 **Solutions:**
 - Ensure certificate matches signer
 - Check if UKI was modified after signing
-- Verify padding was added after signing (not before)
+- Check that the expected slot is being mounted (`-v` shows the selected slot)
 
-### Mount Hangs or Fails
+### Truncated UKI
 
-**Problem:** Driver doesn't exit cleanly
+**Problem:** Mount fails with `Truncated UKI: N bytes needed, M bytes available`
 
-**Check temporary files:**
+**Cause:** The UKI does not fit in the space available for it, typically a slot
+partition smaller than the UKI that was written to it, or an incomplete write.
+
+**Diagnosis:**
 ```bash
-ls -la /tmp/ukifs_verify_*
+./test_slot ukiboot.img a   # compare "UKI size" with "Slot size"
 ```
-
-**If files remain:**
-- Temporary file cleanup failed
-- Driver was killed during verification
-- Clean up manually: `rm /tmp/ukifs_verify_*`
-
-**Prevention:**
-- Temporary files are auto-deleted (unlink after creation)
-- Cleanup happens even on error paths

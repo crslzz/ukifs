@@ -76,8 +76,10 @@ SRCS = ukifs_core.c \
        ukifs_dir.c \
        ukifs_utils.c \
        ukifs_size.c \
+       ukifs_slot.c \
        $(COMPAT)/ukifs_ssl.c \
        $(UKIBOOT)/pe_parser_posix.c \
+       $(UKIBOOT)/gpt_parser.c \
        $(UKIBOOT)/utils.c
 
 # Object files (architecture-specific)
@@ -90,9 +92,12 @@ HDRS = ukifs_core.h \
        ukifs_parse.h \
        ukifs_pe.h \
        ukifs_size.h \
+       ukifs_slot.h \
        ukifs_utils.h \
        $(COMPAT)/config.h \
        $(COMPAT)/sys/endian.h \
+       $(UKIBOOT)/bootctl.h \
+       $(UKIBOOT)/gpt_parser.h \
        $(UKIBOOT)/pe_parser_posix.h \
        $(UKIBOOT)/utils.h \
 
@@ -233,3 +238,4 @@ test_size: test_size.c \
 	    -Wall -Wextra -O2 -g \
 	    -I. -I$(UKIBOOT) -I$(COMPAT)
 	@echo "Build complete: test_size"
+

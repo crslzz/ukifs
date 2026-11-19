@@ -13,7 +13,7 @@
 #include "utils.h"
 
 
-bool uki_compute_size(int fd, uki_size_info_t *info) {
+bool uki_compute_size(int fd, off_t base_offset, uki_size_info_t *info) {
     if (!info) {
         return false;
     }
@@ -23,7 +23,7 @@ bool uki_compute_size(int fd, uki_size_info_t *info) {
 
     /* Read DOS header */
     ImageDosHeader dos_header;
-    if (!full_pread(fd, &dos_header, sizeof(dos_header), 0)) {
+    if (!full_pread(fd, &dos_header, sizeof(dos_header), base_offset)) {
         return false;
     }
 
@@ -36,7 +36,7 @@ bool uki_compute_size(int fd, uki_size_info_t *info) {
 
     /* Read NT header */
     ImageNtHeaders nt_header;
-    if (!full_pread(fd, &nt_header, sizeof(nt_header), nt_offset)) {
+    if (!full_pread(fd, &nt_header, sizeof(nt_header), base_offset + nt_offset)) {
         return false;
     }
 
@@ -62,7 +62,7 @@ bool uki_compute_size(int fd, uki_size_info_t *info) {
     if (opt_header_size >= 68) {  /* Large enough to contain data directories */
         /* Read Optional Header magic to determine PE32 vs PE32+ */
         uint16_t opt_magic;
-        if (full_pread(fd, &opt_magic, sizeof(opt_magic), opt_header_offset)) {
+        if (full_pread(fd, &opt_magic, sizeof(opt_magic), base_offset + opt_header_offset)) {
             opt_magic = le16toh(opt_magic);
             bool is_pe32plus = (opt_magic == 0x20b);  /* PE32+ magic */
 
@@ -71,7 +71,7 @@ bool uki_compute_size(int fd, uki_size_info_t *info) {
 
             /* Read certificate table offset and size */
             uint32_t sec_dir[2];
-            if (full_pread(fd, sec_dir, sizeof(sec_dir), security_dir_offset)) {
+            if (full_pread(fd, sec_dir, sizeof(sec_dir), base_offset + security_dir_offset)) {
                 info->cert_table_offset = le32toh(sec_dir[0]);
                 info->cert_table_size = le32toh(sec_dir[1]);
 
@@ -88,7 +88,8 @@ bool uki_compute_size(int fd, uki_size_info_t *info) {
         return false;
     }
 
-    if (!full_pread(fd, sections, num_sections * sizeof(ImageSectionHeader), sections_offset)) {
+    if (!full_pread(fd, sections, num_sections * sizeof(ImageSectionHeader),
+                    base_offset + sections_offset)) {
         free(sections);
         return false;
     }

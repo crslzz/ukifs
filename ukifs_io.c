@@ -9,6 +9,14 @@
 #include "ukifs_io.h"
 #include "ukifs_core.h"
 
+#include "utils.h"
+
+/* Largest reply served from a temporary buffer when the UKI is not mapped */
+#define UKI_READ_CHUNK_MAX (1024 * 1024)
+
+/* Largest batch of directory entries returned by a single readdir */
+#define UKI_DIRENT_BUF_SIZE 4096
+
 /*
  * Open callback - handles path resolution and file opening
  */
@@ -106,8 +114,19 @@ static int uki_readdir(resmgr_context_t *ctp, io_read_t *msg, uki_ocb_t *ocb) {
         return _RESMGR_NPARTS(0);
     }
 
+    /* Never build more than the client asked for */
+    size_t nbytes = _IO_READ_GET_NBYTES(msg);
+    size_t capacity = (nbytes < UKI_DIRENT_BUF_SIZE) ? nbytes : UKI_DIRENT_BUF_SIZE;
+
+    if (capacity == 0) {
+        DEBUG_LOG("Empty read request");
+        _IO_SET_READ_NBYTES(ctp, 0);
+        DEBUG_EXIT(0);
+        return _RESMGR_NPARTS(0);
+    }
+
     /* Build dirent structures in a buffer */
-    char *buffer = malloc(4096);
+    char *buffer = malloc(capacity);
     if (!buffer) {
         DEBUG_LOG("Failed to allocate buffer");
         DEBUG_EXIT(ENOMEM);
@@ -115,7 +134,6 @@ static int uki_readdir(resmgr_context_t *ctp, io_read_t *msg, uki_ocb_t *ocb) {
     }
 
     size_t buf_used = 0;
-    size_t nbytes = _IO_READ_GET_NBYTES(msg);
 
     /* Add "." and ".." entries first */
     if (index < 2) {
@@ -124,7 +142,7 @@ static int uki_readdir(resmgr_context_t *ctp, io_read_t *msg, uki_ocb_t *ocb) {
         size_t dirent_size = offsetof(struct dirent, d_name) + name_len + 1;
         dirent_size = (dirent_size + 7) & ~7;  /* 8-byte align */
 
-        if (buf_used + dirent_size <= 4096) {
+        if (buf_used + dirent_size <= capacity) {
             struct dirent *dent = (struct dirent *)(buffer + buf_used);
             memset(dent, 0, dirent_size);
             dent->d_ino = (index == 0) ?
@@ -141,14 +159,14 @@ static int uki_readdir(resmgr_context_t *ctp, io_read_t *msg, uki_ocb_t *ocb) {
 
     /* Add directory entries (section files) */
     size_t child_index = (index >= 2) ? index - 2 : 0;
-    while (child_index < dir->num_children && buf_used < nbytes) {
+    while (child_index < dir->num_children) {
         dir_node_t *child = dir->children[child_index];
         const char *child_name = child->name;
         size_t name_len = strlen(child_name);
         size_t dirent_size = offsetof(struct dirent, d_name) + name_len + 1;
         dirent_size = (dirent_size + 7) & ~7;  /* 8-byte align */
 
-        if (buf_used + dirent_size > 4096) {
+        if (buf_used + dirent_size > capacity) {
             break;
         }
 
@@ -165,6 +183,30 @@ static int uki_readdir(resmgr_context_t *ctp, io_read_t *msg, uki_ocb_t *ocb) {
         index = child_index + 2;
     }
 
+    if (buf_used == 0) {
+        /* Not even one entry fits in the buffer of the client */
+        DEBUG_LOG("Buffer too small for a directory entry (%zu bytes)", capacity);
+        free(buffer);
+        DEBUG_EXIT(EINVAL);
+        return EINVAL;
+    }
+
+    /* Hand the entries to the client, then release the buffer. Using
+     * SETIOV() here would need the buffer to outlive this function, as
+     * the framework only replies once it returns. */
+    DEBUG_VAL("buf_used", buf_used);
+
+    ssize_t written = resmgr_msgwrite(ctp, buffer, buf_used, 0);
+
+    free(buffer);
+
+    if (written < 0 || (size_t)written != buf_used) {
+        ERROR_LOG("[READDIR] failed to return %zu bytes: %s",
+                  buf_used, strerror(errno));
+        DEBUG_EXIT(EIO);
+        return EIO;
+    }
+
     /* Update position */
     ocb->dir_index = index;
 
@@ -173,13 +215,82 @@ static int uki_readdir(resmgr_context_t *ctp, io_read_t *msg, uki_ocb_t *ocb) {
         ocb->ocb.attr->flags |= IOFUNC_ATTR_ATIME;
     }
 
-    /* Return directory entries */
-    DEBUG_VAL("buf_used", buf_used);
     _IO_SET_READ_NBYTES(ctp, buf_used);
-    SETIOV(ctp->iov, buffer, buf_used);
 
-    DEBUG_EXIT(1);
-    return _RESMGR_NPARTS(1);
+    DEBUG_EXIT(0);
+    return _RESMGR_NPARTS(0);
+}
+
+/*
+ * Serve a read when the UKI is not mapped.
+ *
+ * Block devices usually cannot be mmap'd, so the data is read from the
+ * device into a temporary buffer. The buffer is copied to the client
+ * with resmgr_msgwrite() while the request is being handled, rather
+ * than handed to the framework with SETIOV(), which would require the
+ * buffer to stay alive after this function returns. resmgr_msgwrite()
+ * also places the data at the right offset of the reply, so reads that
+ * are part of a combine message keep working.
+ */
+static int uki_read_unmapped(resmgr_context_t *ctp, uki_ocb_t *ocb,
+                             uki_context_t *ctx, uint32_t file_position,
+                             size_t nbytes) {
+    DEBUG_ENTER();
+
+    /* Bound the size of a single reply: a short read is legal, and this
+     * keeps a huge request from allocating a huge buffer */
+    if (nbytes > UKI_READ_CHUNK_MAX) {
+        DEBUG_LOG("[READ] clamping unmapped read from %zu to %u bytes",
+                  nbytes, UKI_READ_CHUNK_MAX);
+        nbytes = UKI_READ_CHUNK_MAX;
+    }
+
+    void *buffer = malloc(nbytes);
+    if (!buffer) {
+        ERROR_LOG("[READ] file='%s' failed to allocate %zu bytes",
+                  ocb->entry->name, nbytes);
+        DEBUG_EXIT(ENOMEM);
+        return ENOMEM;
+    }
+
+    off_t position = ctx->uki_offset + (off_t)file_position;
+
+    if (!full_pread(ctx->uki_fd, buffer, nbytes, position)) {
+        ERROR_LOG("[READ] file='%s' failed to read %zu bytes at offset %lld",
+                  ocb->entry->name, nbytes, (long long)position);
+        free(buffer);
+        DEBUG_EXIT(EIO);
+        return EIO;
+    }
+
+    DEBUG_LOG("[READ] file='%s' read %zu bytes at device offset %lld",
+              ocb->entry->name, nbytes, (long long)position);
+
+    /* Hand the data to the client, then release the buffer */
+    ssize_t written = resmgr_msgwrite(ctp, buffer, nbytes, 0);
+
+    free(buffer);
+
+    if (written < 0 || (size_t)written != nbytes) {
+        ERROR_LOG("[READ] file='%s' failed to return %zu bytes: %s",
+                  ocb->entry->name, nbytes, strerror(errno));
+        DEBUG_EXIT(EIO);
+        return EIO;
+    }
+
+    /* Update offset for next read */
+    ocb->ocb.offset += nbytes;
+
+    /* Mark as read */
+    if (ocb->ocb.attr) {
+        ocb->ocb.attr->flags |= IOFUNC_ATTR_ATIME;
+    }
+
+    _IO_SET_READ_NBYTES(ctp, nbytes);
+
+    DEBUG_VAL("returning nbytes", nbytes);
+    DEBUG_EXIT(0);
+    return _RESMGR_NPARTS(0);
 }
 
 /*
@@ -258,16 +369,25 @@ int uki_read(resmgr_context_t *ctp, io_read_t *msg, RESMGR_OCB_T *ocb_base) {
                  ocb->entry->name, original_nbytes, nbytes);
     }
 
-    /* Calculate the actual file position being read */
+    /* Calculate the position of the data within the UKI */
     uint32_t file_position = ocb->entry->file_offset + offset;
+
+    /* Log data chunk being returned */
+    DEBUG_LOG("[READ] file='%s' returning chunk: file_offset=%u section_offset=%ld nbytes=%zu (uki_pos %u-%u)",
+              ocb->entry->name, ocb->entry->file_offset, (long)offset, nbytes,
+              file_position, file_position + (uint32_t)nbytes - 1);
+
+    if (!ctx->mmap_base) {
+        /* No mapping (typically a block device): read the data from the
+         * device and copy it to the client */
+        int result = uki_read_unmapped(ctp, ocb, ctx, file_position, nbytes);
+        DEBUG_EXIT(result);
+        return result;
+    }
+
     const char *data = (const char *)ctx->mmap_base + file_position;
     DEBUG_LOG("[READ] file='%s' mmap_base=%p + file_position=%u = data %p",
               ocb->entry->name, ctx->mmap_base, file_position, data);
-
-    /* Log data chunk being returned */
-    DEBUG_LOG("[READ] file='%s' returning chunk: file_offset=%u section_offset=%ld nbytes=%zu (file_pos %u-%u)",
-              ocb->entry->name, ocb->entry->file_offset, (long)offset, nbytes,
-              file_position, file_position + (uint32_t)nbytes - 1);
 
     /* Update offset for next read */
     ocb->ocb.offset += nbytes;

@@ -17,6 +17,7 @@
 
 #include "ukifs_utils.h"
 #include "ukifs_dir.h"
+#include "ukifs_slot.h"
 
 
 /* Hash table size for path lookups */
@@ -47,10 +48,22 @@ typedef struct uki_entry {
  * Maintains all state for the UKI filesystem instance
  */
 typedef struct uki_context {
-    void *mmap_base;               /* Base address of mmap'd UKI file */
-    size_t mmap_size;              /* Size of mmap'd region */
-    int uki_fd;                    /* File descriptor for UKI file */
+    void *mmap_base;               /* Address of the UKI within the mapping,
+                                      NULL when the UKI is read with pread()  */
+    void *map_addr;                /* Base address of the mapping (page aligned) */
+    size_t map_len;                /* Length of the mapping */
+    off_t uki_offset;              /* Offset of the UKI in the opened file */
+    size_t uki_size;               /* Bytes available for the UKI */
+    int uki_fd;                    /* File descriptor for UKI file/disk image */
+    bool no_mmap;                  /* Never mmap, always read with pread() */
     mode_t perm;                   /* File permissions */
+
+    struct stat src_stat;          /* Stat of the source, timestamps fixed up
+                                      for sources that have none (devices) */
+
+    uki_slot_sel_t slot_sel;       /* Requested ukiboot slot (or NONE) */
+    int slot;                      /* Selected ukiboot slot (-1 if none) */
+    char *bootctl_path;            /* Optional standalone ukibootctl partition */
 
     dir_node_t *root;              /* Root of directory tree */
     uki_entry_t **hash_table;      /* Hash table for path lookups */

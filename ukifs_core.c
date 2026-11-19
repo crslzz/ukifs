@@ -2,9 +2,11 @@
  * QNX UKI Filesystem entry point
  */
 
+#include <getopt.h>
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
+#include <time.h>
 #include <sys/mman.h>
 #include <sys/dispatch.h>
 
@@ -12,8 +14,10 @@
 #include "ukifs_size.h"
 #include "ukifs_parse.h"
 #include "ukifs_io.h"
+#include "ukifs_slot.h"
 
 #include "pe_parser_posix.h"
+#include "utils.h"
 
 /* Global context for signal handler */
 static uki_context_t *g_ctx = NULL;
@@ -68,9 +72,10 @@ static void cleanup(uki_context_t *ctx) {
         }
 
         /* Step 6: Unmap file */
-        if (ctx->mmap_base && ctx->mmap_base != MAP_FAILED) {
+        if (ctx->map_addr && ctx->map_addr != MAP_FAILED) {
             DEBUG_LOG("Unmapping UKI file");
-            munmap(ctx->mmap_base, ctx->mmap_size);
+            munmap(ctx->map_addr, ctx->map_len);
+            ctx->map_addr = NULL;
             ctx->mmap_base = NULL;
         }
 
@@ -112,6 +117,49 @@ static void signal_handler(int signo UNUSED) {
     exit(0);
 }
 
+/* Long-only option values */
+#define OPT_BOOTCTL 256
+#define OPT_NO_MMAP 257
+
+static void usage(const char *argv0) {
+    fprintf(stderr, "Usage: %s [options] <uki-file|ukiboot-image> <mount-point>\n", argv0);
+    fprintf(stderr, "\n");
+    fprintf(stderr, "Mount a UKI (Unified Kernel Image) as a read-only filesystem.\n");
+    fprintf(stderr, "The UKI is either a plain UKI file, or the content of one of the\n");
+    fprintf(stderr, "ukiboot_a / ukiboot_b slots of a ukiboot disk image.\n");
+    fprintf(stderr, "\n");
+    fprintf(stderr, "Options:\n");
+    fprintf(stderr, "  -v, --verbose       Verbose mode (info messages)\n");
+    fprintf(stderr, "  -p, --perm <perm>   File permission (default: %04o)\n", UKI_FILES_PERM);
+    fprintf(stderr, "  -d, --debug <level> Debug level: 0=quiet, 1=errors, 2=info, 3=debug (default: %d)\n", g_log_level);
+    fprintf(stderr, "  -c, --cert <cert.pem>\n");
+    fprintf(stderr, "                      X.509 PEM certificate for signature verification\n");
+    fprintf(stderr, "  -s, --slot <a|b|auto>\n");
+    fprintf(stderr, "                      Read the UKI from a slot of a ukiboot disk image:\n");
+    fprintf(stderr, "                      'a' (%s), 'b' (%s), or 'auto' to\n",
+	    UKI_SLOT_A_PART_NAME, UKI_SLOT_B_PART_NAME);
+    fprintf(stderr, "                      select the active slot from the %s partition\n",
+	    UKI_BOOTCTL_PART_NAME);
+    fprintf(stderr, "  -A, --slot-a        Same as --slot a\n");
+    fprintf(stderr, "  -B, --slot-b        Same as --slot b\n");
+    fprintf(stderr, "      --bootctl <path>\n");
+    fprintf(stderr, "                      Path to a standalone %s partition, used\n",
+	    UKI_BOOTCTL_PART_NAME);
+    fprintf(stderr, "                      instead of the one of the disk image (implies --slot auto)\n");
+    fprintf(stderr, "      --no-mmap       Never map the UKI, always read it with pread()\n");
+    fprintf(stderr, "                      (automatic when the source cannot be mapped)\n");
+    fprintf(stderr, "  -h, --help          Show this help\n");
+    fprintf(stderr, "\n");
+    fprintf(stderr, "Examples:\n");
+    fprintf(stderr, "  %s /boot/ukiboot.efi /mnt/uki\n", argv0);
+    fprintf(stderr, "  %s -v /boot/ukiboot.efi /mnt/uki\n", argv0);
+    fprintf(stderr, "  %s -c /etc/uki-cert.pem /boot/ukiboot.efi /mnt/uki\n", argv0);
+    fprintf(stderr, "  %s -d 3 /boot/ukiboot.efi /mnt/uki  # Full debug traces\n", argv0);
+    fprintf(stderr, "  %s --slot auto /dev/hd0 /mnt/uki    # Active slot of a ukiboot disk\n", argv0);
+    fprintf(stderr, "  %s --slot-b /tmp/ukiboot.img /mnt/uki\n", argv0);
+    fprintf(stderr, "  %s --slot auto /dev/hd1t179 /mnt/uki # ukiboot image in a partition\n", argv0);
+}
+
 /* Parse command line arguments */
 static int parse_arguments(int argc, char *argv[], uki_context_t *ctx) {
     int opt;
@@ -119,11 +167,30 @@ static int parse_arguments(int argc, char *argv[], uki_context_t *ctx) {
     mode_t perm = UKI_FILES_PERM; /* default permissions */
     int log_level = g_log_level; /* default log level */
 
+    static const struct option long_options[] = {
+	{"verbose", no_argument,       NULL, 'v'},
+	{"perm",    required_argument, NULL, 'p'},
+	{"debug",   required_argument, NULL, 'd'},
+	{"cert",    required_argument, NULL, 'c'},
+	{"slot",    required_argument, NULL, 's'},
+	{"slot-a",  no_argument,       NULL, 'A'},
+	{"slot-b",  no_argument,       NULL, 'B'},
+	{"bootctl", required_argument, NULL, OPT_BOOTCTL},
+	{"no-mmap", no_argument,       NULL, OPT_NO_MMAP},
+	{"help",    no_argument,       NULL, 'h'},
+	{NULL,      0,                 NULL, 0},
+    };
+
     /* Initialize optional fields */
     ctx->cert_path = NULL;
+    ctx->bootctl_path = NULL;
+    ctx->no_mmap = false;
+    ctx->slot_sel = UKI_SLOT_SEL_NONE;
+    ctx->slot = -1;
 
     /* Parse options */
-    while ((opt = getopt(argc, argv, "vp:d:c:h")) != -1) {
+    while ((opt = getopt_long(argc, argv, "vp:d:c:s:ABh",
+			      long_options, NULL)) != -1) {
         switch (opt) {
 	case 'v':
 	    log_level = LOG_INFO;
@@ -146,37 +213,51 @@ static int parse_arguments(int argc, char *argv[], uki_context_t *ctx) {
 	case 'c':
 	    ctx->cert_path = optarg;
 	    break;
+	case 's':
+	    if (!uki_slot_parse_sel(optarg, &ctx->slot_sel)) {
+		fprintf(stderr, "Invalid slot: %s (must be 'a', 'b' or 'auto')\n", optarg);
+		return -1;
+	    }
+	    break;
+	case 'A':
+	    ctx->slot_sel = UKI_SLOT_SEL_A;
+	    break;
+	case 'B':
+	    ctx->slot_sel = UKI_SLOT_SEL_B;
+	    break;
+	case OPT_BOOTCTL:
+	    ctx->bootctl_path = optarg;
+	    break;
+	case OPT_NO_MMAP:
+	    ctx->no_mmap = true;
+	    break;
 	case 'h':
+	    usage(argv[0]);
+	    return -1;
 	default:
-	    fprintf(stderr, "Usage: %s [options] <uki-file> <mount-point>\n", argv[0]);
-	    fprintf(stderr, "\n");
-	    fprintf(stderr, "Mount a UKI (Unified Kernel Image) as a read-only filesystem.\n");
-	    fprintf(stderr, "\n");
-	    fprintf(stderr, "Options:\n");
-	    fprintf(stderr, "  -v             Verbose mode (info messages)\n");
-	    fprintf(stderr, "  -p <perm>      File permission (default: %04o)\n", UKI_FILES_PERM);
-	    fprintf(stderr, "  -d <level>     Debug level: 0=quiet, 1=errors, 2=info, 3=debug (default: %d)\n", g_log_level);
-	    fprintf(stderr, "  -c <cert.pem>  X.509 PEM certificate for signature verification\n");
-	    fprintf(stderr, "  -h             Show this help\n");
-	    fprintf(stderr, "\n");
-	    fprintf(stderr, "Examples:\n");
-	    fprintf(stderr, "  %s /boot/ukiboot.efi /mnt/uki\n", argv[0]);
-	    fprintf(stderr, "  %s -v /boot/ukiboot.efi /mnt/uki\n", argv[0]);
-	    fprintf(stderr, "  %s -c /etc/uki-cert.pem /boot/ukiboot.efi /mnt/uki\n", argv[0]);
-	    fprintf(stderr, "  %s -d 3 /boot/ukiboot.efi /mnt/uki  # Full debug traces\n", argv[0]);
+	    usage(argv[0]);
 	    return -1;
         }
+    }
+
+    /* A standalone ukibootctl partition only makes sense for an
+     * automatic slot selection */
+    if (ctx->bootctl_path && ctx->slot_sel == UKI_SLOT_SEL_NONE) {
+	ctx->slot_sel = UKI_SLOT_SEL_AUTO;
     }
 
     /* Check for required positional arguments */
     if (optind + 2 != argc) {
         fprintf(stderr, "Error: Missing required arguments\n");
-        fprintf(stderr, "Usage: %s [options] <uki-file> <mount-point>\n", argv[0]);
+        fprintf(stderr, "Usage: %s [options] <uki-file|ukiboot-image> <mount-point>\n", argv[0]);
         fprintf(stderr, "Try '%s -h' for more information.\n", argv[0]);
         return -1;
     }
 
     g_log_level = log_level;
+
+    /* Let ukiboot's helpers log along with our info messages */
+    opt_verbose = (log_level >= LOG_INFO);
 
     ctx->uki_path = argv[optind];
     ctx->mount_point = argv[optind + 1];
@@ -186,6 +267,112 @@ static int parse_arguments(int argc, char *argv[], uki_context_t *ctx) {
     DEBUG_STR("Mount point", ctx->mount_point);
 
     return 0;
+}
+
+/*
+ * Locate the UKI within the opened file or device.
+ *
+ * Without a slot selection the whole media is the UKI. Otherwise it is a
+ * ukiboot disk image, and the UKI is the content of the selected
+ * ukiboot_a / ukiboot_b partition.
+ *
+ * Returns 0 on success, -1 on error.
+ */
+static int locate_uki(uki_context_t *ctx, off_t media_bytes,
+		      bool size_is_exact) {
+    if (ctx->slot_sel == UKI_SLOT_SEL_NONE) {
+	if (media_bytes <= 0) {
+	    ERROR_LOG("Cannot determine the size of '%s'", ctx->uki_path);
+	    return -1;
+	}
+	ctx->uki_offset = 0;
+	ctx->uki_size = (size_t)media_bytes;
+	ctx->slot = -1;
+	return 0;
+    }
+
+    uki_slot_info_t slot_info;
+
+    if (!uki_slot_locate(ctx->uki_fd, ctx->slot_sel,
+			 ctx->bootctl_path, &slot_info)) {
+	ERROR_LOG("Failed to locate a ukiboot slot in '%s'", ctx->uki_path);
+	return -1;
+    }
+
+    ctx->slot = slot_info.slot;
+    ctx->uki_offset = (off_t)slot_info.offset;
+    ctx->uki_size = (size_t)slot_info.size;
+
+    /* The slot may lie past the end of the media, for instance when an
+     * image file is truncated. Only an exact size is trusted here: the
+     * size reported by a device driver is not worth failing on, a read
+     * that really is out of range fails on its own. */
+    if (media_bytes > 0 &&
+	(off_t)(slot_info.offset + slot_info.size) > media_bytes) {
+	if (!size_is_exact) {
+	    INFO_LOG("Slot %c ends past the reported size of '%s' (%lld bytes), "
+		     "trusting the partition table",
+		     uki_slot_letter(ctx->slot), ctx->uki_path,
+		     (long long)media_bytes);
+	} else if ((off_t)slot_info.offset >= media_bytes) {
+	    ERROR_LOG("Slot %c starts at offset %llu, past the end of '%s'",
+		      uki_slot_letter(slot_info.slot),
+		      (unsigned long long)slot_info.offset, ctx->uki_path);
+	    return -1;
+	} else {
+	    ctx->uki_size = (size_t)(media_bytes - (off_t)slot_info.offset);
+	    INFO_LOG("Slot %c extends past the end of '%s', clamping to %zu bytes",
+		     uki_slot_letter(ctx->slot), ctx->uki_path, ctx->uki_size);
+	}
+    }
+
+    INFO_LOG("Using ukiboot slot %c at offset %lld (%zu bytes)",
+	     uki_slot_letter(ctx->slot), (long long)ctx->uki_offset,
+	     ctx->uki_size);
+
+    return 0;
+}
+
+/*
+ * Map the UKI region of the opened file.
+ *
+ * mmap() offsets must be page aligned, so the mapping starts at the page
+ * holding the beginning of the UKI, and mmap_base points to the UKI itself.
+ *
+ * Mapping is an optimization: it lets reads be served straight out of the
+ * mapping, without copying. Block devices usually cannot be mapped (QNX
+ * block drivers do not implement mmap), in which case the UKI is read
+ * with pread() instead, and mmap_base stays NULL.
+ */
+static void map_uki(uki_context_t *ctx) {
+    if (ctx->no_mmap) {
+	INFO_LOG("Mapping disabled, reading the UKI with pread()");
+	return;
+    }
+
+    long page_size = sysconf(_SC_PAGESIZE);
+
+    if (page_size <= 0) {
+	page_size = 4096;
+    }
+
+    off_t map_offset = ctx->uki_offset & ~((off_t)page_size - 1);
+    size_t delta = (size_t)(ctx->uki_offset - map_offset);
+
+    ctx->map_len = ctx->uki_size + delta;
+    ctx->map_addr = mmap(NULL, ctx->map_len, PROT_READ, MAP_SHARED,
+			 ctx->uki_fd, map_offset);
+    if (ctx->map_addr == MAP_FAILED) {
+	INFO_LOG("Cannot map '%s' (%s), reading the UKI with pread() instead",
+		 ctx->uki_path, strerror(errno));
+	ctx->map_addr = NULL;
+	ctx->map_len = 0;
+	return;
+    }
+
+    ctx->mmap_base = (char *)ctx->map_addr + delta;
+
+    INFO_LOG("Mapped UKI at %p (%zu bytes)", ctx->mmap_base, ctx->uki_size);
 }
 
 
@@ -257,8 +444,10 @@ int main(int argc, char *argv[]) {
     signal(SIGTERM, signal_handler);
     signal(SIGALRM, alarm_handler);
 
-    /* Open UKI file */
-    INFO_LOG("Opening UKI file: %s", ctx->uki_path);
+    /* Open UKI file or ukiboot disk image */
+    INFO_LOG("Opening %s: %s",
+	     (ctx->slot_sel == UKI_SLOT_SEL_NONE) ? "UKI file" : "ukiboot image",
+	     ctx->uki_path);
     ctx->uki_fd = open(ctx->uki_path, O_RDONLY);
     if (ctx->uki_fd < 0) {
         ERROR_LOG("Failed to open UKI file '%s': %s",
@@ -268,28 +457,46 @@ int main(int argc, char *argv[]) {
         return EXIT_FAILURE;
     }
 
-    /* Get file size */
+    /* Get the type and the timestamps of the source */
     if (fstat(ctx->uki_fd, &st) != 0) {
         ERROR_LOG("Failed to stat UKI file: %s", strerror(errno));
         cleanup(ctx);
         free(ctx);
         return EXIT_FAILURE;
     }
-    ctx->mmap_size = st.st_size;
+    /* A size of 0 is not fatal when a slot is selected: the partition
+     * table then tells where the UKI is and how large its slot is */
+    off_t media_bytes = uki_media_size(ctx->uki_fd);
 
-    INFO_LOG("UKI file size: %zu bytes", ctx->mmap_size);
+    /* Block devices carry no meaningful timestamps: date the files of the
+     * filesystem from the moment they were published instead of 1970 */
+    if (!S_ISREG(st.st_mode) || st.st_mtime == 0) {
+        time_t now = time(NULL);
 
-    /* Memory-map the UKI file */
-    ctx->mmap_base = mmap(NULL, ctx->mmap_size, PROT_READ,
-                          MAP_SHARED, ctx->uki_fd, 0);
-    if (ctx->mmap_base == MAP_FAILED) {
-        ERROR_LOG("Failed to mmap UKI file: %s", strerror(errno));
+        st.st_mtime = now;
+        st.st_ctime = now;
+        st.st_atime = now;
+    }
+    ctx->src_stat = st;
+
+    bool size_is_exact = S_ISREG(st.st_mode);
+
+    INFO_LOG("Source: %s, size: %lld bytes%s",
+             size_is_exact ? "regular file" :
+             S_ISBLK(st.st_mode) ? "block device" :
+             S_ISCHR(st.st_mode) ? "character device" : "special file",
+             (long long)media_bytes,
+             size_is_exact ? "" : " (as reported by the driver)");
+
+    /* Find the UKI: either the whole media, or a ukiboot slot partition */
+    if (locate_uki(ctx, media_bytes, size_is_exact) != 0) {
         cleanup(ctx);
         free(ctx);
         return EXIT_FAILURE;
     }
 
-    INFO_LOG("Mapped UKI file at %p", ctx->mmap_base);
+    /* Map the UKI, or fall back to reading it with pread() */
+    map_uki(ctx);
 
     /* Allocate hash table */
     ctx->hash_table_size = HASH_TABLE_SIZE;
@@ -301,91 +508,37 @@ int main(int argc, char *argv[]) {
         return EXIT_FAILURE;
     }
 
-    /* Verify signature if certificate provided */
-    if (ctx->cert_path) {
-        INFO_LOG("Verifying UKI signature with certificate: %s", ctx->cert_path);
+    /* Check that the UKI fits in the space available for it */
+    uki_size_info_t size_info;
+    if (uki_compute_size(ctx->uki_fd, ctx->uki_offset, &size_info)) {
+        INFO_LOG("UKI size: %u bytes (%zu bytes available)",
+                 size_info.expected_size, ctx->uki_size);
 
-        /* Compute actual UKI size (excluding padding) */
-        uki_size_info_t size_info;
-        if (!uki_compute_size(ctx->uki_fd, &size_info)) {
-            ERROR_LOG("Failed to compute UKI size for signature verification");
+        if ((size_t)size_info.expected_size > ctx->uki_size) {
+            ERROR_LOG("Truncated UKI: %u bytes needed, %zu bytes available",
+                      size_info.expected_size, ctx->uki_size);
             cleanup(ctx);
             free(ctx);
             return EXIT_FAILURE;
         }
 
-        INFO_LOG("File size: %zu bytes, UKI size: %u bytes",
-                 ctx->mmap_size, size_info.expected_size);
-
-        int verify_fd = ctx->uki_fd;
-        int temp_fd = -1;
-
-        /* Check if file has padding beyond the UKI */
-        if ((size_t)size_info.expected_size < ctx->mmap_size) {
-            size_t padding = ctx->mmap_size - size_info.expected_size;
-            INFO_LOG("Detected %zu bytes of padding (%.1f%% of file)",
-                     padding, (padding * 100.0) / ctx->mmap_size);
-            INFO_LOG("Creating temporary file for signature verification (excluding padding)");
-
-            /* Create temporary file with just UKI data */
-            char temp_path[] = "/tmp/ukifs_verify_XXXXXX";
-            temp_fd = mkstemp(temp_path);
-            if (temp_fd < 0) {
-                ERROR_LOG("Failed to create temporary file: %s", strerror(errno));
-                cleanup(ctx);
-                free(ctx);
-                return EXIT_FAILURE;
-            }
-
-            /* Unlink immediately so it's cleaned up on exit */
-            unlink(temp_path);
-
-            /* Copy UKI data to temporary file */
-            off_t remaining = size_info.expected_size;
-            off_t offset = 0;
-            char buffer[64 * 1024];
-
-            while (remaining > 0) {
-                size_t to_read = (remaining > (off_t)sizeof(buffer)) ? sizeof(buffer) : (size_t)remaining;
-                ssize_t nread = pread(ctx->uki_fd, buffer, to_read, offset);
-                if (nread <= 0) {
-                    ERROR_LOG("Failed to read UKI data: %s", strerror(errno));
-                    close(temp_fd);
-                    cleanup(ctx);
-                    free(ctx);
-                    return EXIT_FAILURE;
-                }
-
-                ssize_t nwritten = write(temp_fd, buffer, nread);
-                if (nwritten != nread) {
-                    ERROR_LOG("Failed to write to temporary file: %s", strerror(errno));
-                    close(temp_fd);
-                    cleanup(ctx);
-                    free(ctx);
-                    return EXIT_FAILURE;
-                }
-
-                offset += nread;
-                remaining -= nread;
-            }
-
-            /* Use temporary file for verification */
-            verify_fd = temp_fd;
-            lseek(verify_fd, 0, SEEK_SET);
-            INFO_LOG("Verifying signature against UKI data only (%u bytes)", size_info.expected_size);
+        if ((size_t)size_info.expected_size < ctx->uki_size) {
+            size_t padding = ctx->uki_size - size_info.expected_size;
+            INFO_LOG("Ignoring %zu bytes of padding after the UKI (%.1f%%)",
+                     padding, (padding * 100.0) / ctx->uki_size);
         }
+    }
 
-        /* Verify signature */
-        bool sig_valid = pe_verify_signature(verify_fd, 0, ctx->cert_path);
+    /* Verify signature if certificate provided */
+    if (ctx->cert_path) {
+        INFO_LOG("Verifying UKI signature with certificate: %s", ctx->cert_path);
 
-        /* Cleanup temporary file if created */
-        if (temp_fd >= 0) {
-            close(temp_fd);
-        }
-
-        if (!sig_valid) {
+        /* The Authenticode digest covers the PE headers, the sections and
+         * the certificate table only. Any padding after the UKI (such as
+         * the remainder of a ukiboot slot partition) is not part of it. */
+        if (!pe_verify_signature(ctx->uki_fd, ctx->uki_offset, ctx->cert_path)) {
             ERROR_LOG("UKI signature verification failed!");
-            ERROR_LOG("The UKI file is not properly signed or the signature is invalid.");
+            ERROR_LOG("The UKI is not properly signed or the signature is invalid.");
             cleanup(ctx);
             free(ctx);
             return EXIT_FAILURE;

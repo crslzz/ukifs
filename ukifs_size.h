@@ -32,12 +32,13 @@ typedef struct {
  * needed based on headers, sections, and certificate table (if present).
  *
  * Parameters:
- *   fd - Open file descriptor to UKI file
+ *   fd - Open file descriptor to the UKI file or disk image
+ *   base_offset - Offset of the UKI within the file (0 for a plain UKI)
  *   info - Output structure to receive size information
  *
  * Returns:
  *   true on success, false on error (invalid PE file, read error, etc.)
  */
-bool uki_compute_size(int fd, uki_size_info_t *info);
+bool uki_compute_size(int fd, off_t base_offset, uki_size_info_t *info);
 
 #endif /* UKIFS_SIZE_H */
