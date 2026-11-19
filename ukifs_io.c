@@ -5,6 +5,7 @@
 #include <stddef.h>
 #include <string.h>
 #include <dirent.h>
+#include <sys/mount.h>
 
 #include "ukifs_io.h"
 #include "ukifs_core.h"
@@ -81,6 +82,56 @@ int uki_open(resmgr_context_t *ctp, io_open_t *msg,
     DEBUG_VAL("iofunc_open_default result", result);
     DEBUG_EXIT(result);
     return result;
+}
+
+/*
+ * Mount callback - only used to support unmounting
+ *
+ * ukifs serves a single mountpoint, so unmounting it means detaching
+ * and exiting. The request is answered first and the filesystem is
+ * taken down by the main thread, so that umount() does not wait for
+ * the mountpoint it is removing.
+ */
+int uki_mount(resmgr_context_t *ctp UNUSED, io_mount_t *msg UNUSED,
+              RESMGR_HANDLE_T *handle, io_mount_extra_t *extra) {
+    DEBUG_ENTER();
+
+    if (!extra) {
+        DEBUG_LOG("No mount extra data");
+        DEBUG_EXIT(ENOSYS);
+        return ENOSYS;
+    }
+
+    DEBUG_VALX("mount flags", extra->flags);
+
+    if (!(extra->flags & _MOUNT_UNMOUNT)) {
+        /* Mounting and remounting are not supported: the filesystem is
+         * attached by the command line of ukifs */
+        DEBUG_LOG("Not an unmount request");
+        DEBUG_EXIT(ENOSYS);
+        return ENOSYS;
+    }
+
+    /* Refuse to pull the filesystem from under a client that is still
+     * reading it, unless the unmount is forced */
+    if (handle && !(extra->flags & _MOUNT_FORCE)) {
+        uki_context_t *ctx = uki_context(((IOFUNC_ATTR_T *)handle)->mount);
+
+        if (uki_fs_busy(ctx)) {
+            INFO_LOG("[UMOUNT] refused, files are still open");
+            DEBUG_EXIT(EBUSY);
+            return EBUSY;
+        }
+    }
+
+    INFO_LOG("[UMOUNT] unmount requested%s",
+             (extra->flags & _MOUNT_FORCE) ? " (forced)" : "");
+
+    /* Reply first, then let the main thread detach and exit */
+    uki_request_shutdown();
+
+    DEBUG_EXIT(EOK);
+    return EOK;
 }
 
 /*

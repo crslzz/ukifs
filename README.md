@@ -91,6 +91,24 @@ cat /mnt/uki/uname
 6.12.0-210.el10iv.aarch64
 ```
 
+### Unmounting
+
+`ukifs` serves a single mountpoint, so unmounting it means stopping the
+driver. Both of these do it cleanly:
+
+```bash
+umount /mnt/uki     # unmount, refused with EBUSY while a file is open
+umount -f /mnt/uki  # unmount even if a client still has a file open
+slay ukifs          # SIGTERM, same shutdown path (SIGINT too)
+```
+
+The mountpoint is detached first, so it disappears from the pathname space
+before anything else happens, the requests still being served are given a
+moment to finish, and the process exits; the mapping, the descriptor and the
+memory are released by process exit. A client that still had a section open
+when the filesystem was forced out gets an error on its next read, so prefer
+plain `umount` and let it tell you the filesystem is busy.
+
 ## ukiboot A/B slots
 
 A [ukiboot](https://gitlab.com/CentOS/automotive/src/ukiboot) disk image holds

@@ -9,6 +9,8 @@
 
 int uki_open(resmgr_context_t *ctp, io_open_t *msg,
              RESMGR_HANDLE_T *handle, void *extra);
+int uki_mount(resmgr_context_t *ctp, io_mount_t *msg,
+              RESMGR_HANDLE_T *handle, io_mount_extra_t *extra);
 int uki_read(resmgr_context_t *ctp, io_read_t *msg,
              RESMGR_OCB_T *ocb);
 int uki_lseek(resmgr_context_t *ctp, io_lseek_t *msg,

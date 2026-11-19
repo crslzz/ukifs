@@ -3,6 +3,7 @@
  */
 
 #include <getopt.h>
+#include <semaphore.h>
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
@@ -22,7 +23,21 @@
 /* Global context for signal handler */
 static uki_context_t *g_ctx = NULL;
 
+/*
+ * Shutdown request, posted by the signal handler and by the unmount
+ * handler, waited for by the main thread. A semaphore is used because
+ * sem_post() is async-signal-safe, and because the signal may be
+ * handled by any thread of the pool, not by the main one.
+ */
+static sem_t g_shutdown_sem;
+static volatile sig_atomic_t g_shutdown_signal = 0;
+
 int g_log_level = LOG_ERROR;  /* Default log level */
+
+/* Ask the main thread to unmount the filesystem and exit */
+void uki_request_shutdown(void) {
+    (void)sem_post(&g_shutdown_sem);
+}
 
 
 /* Cleanup resources */
@@ -92,29 +107,26 @@ static void cleanup(uki_context_t *ctx) {
     DEBUG_EXIT(0);
 }
 
-/* Alarm handler for forced exit */
+/* Alarm handler, last resort if the shutdown itself gets stuck */
 static void alarm_handler(int signo UNUSED) {
-    ERROR_LOG("Forced shutdown (thread pool not responding)");
+    static const char msg[] = "[ERROR] Shutdown timed out, exiting\n";
+
+    /* Only async-signal-safe calls here */
+    (void)!write(STDERR_FILENO, msg, sizeof(msg) - 1);
     _exit(1);
 }
 
-/* Signal handler for cleanup */
-static void signal_handler(int signo UNUSED) {
-    DEBUG_LOG("Received signal %d, shutting down...", signo);
-
-    /* Set alarm for forced exit in case cleanup hangs */
-    alarm(3);  /* Force exit after 3 seconds */
-
-    /* Do cleanup directly */
-    if (g_ctx) {
-        cleanup(g_ctx);
-        free(g_ctx);
-        g_ctx = NULL;
-    }
-
-    /* Cancel alarm and exit cleanly */
-    alarm(0);
-    exit(0);
+/*
+ * Signal handler for shutdown.
+ *
+ * It only wakes the main thread: tearing the filesystem down from a
+ * signal handler means calling free(), munmap() and the resource
+ * manager library from a context where none of them may be used, and
+ * doing it while the pool threads are still serving requests.
+ */
+static void signal_handler(int signo) {
+    g_shutdown_signal = signo;
+    (void)sem_post(&g_shutdown_sem);
 }
 
 /* Long-only option values */
@@ -376,6 +388,59 @@ static void map_uki(uki_context_t *ctx) {
 }
 
 
+/*
+ * Shut a running filesystem down.
+ *
+ * Detaching removes the mountpoint from the pathname space, so no new
+ * request can arrive; the requests still in flight are given a moment
+ * to finish. Nothing is freed or unmapped on purpose: the pool threads
+ * are blocked in MsgReceive() and may still be serving a read, and
+ * process exit releases the mapping, the descriptor and the memory
+ * anyway. Destroying the thread pool here would only wait for threads
+ * that are about to disappear.
+ */
+static void shutdown_fs(uki_context_t *ctx) {
+    DEBUG_ENTER();
+
+    /* Last resort, should the detach itself block */
+    alarm(5);
+
+    if (ctx->resmgr_id != -1 && ctx->dpp) {
+        INFO_LOG("Detaching the filesystem from %s", ctx->mount_point);
+        resmgr_detach(ctx->dpp, ctx->resmgr_id, _RESMGR_DETACH_ALL);
+        ctx->resmgr_id = -1;
+    }
+
+    /* Let the requests being served finish */
+    usleep(100000);  /* 100ms */
+
+    alarm(0);
+
+    INFO_LOG("UKI filesystem unmounted");
+
+    DEBUG_EXIT(0);
+}
+
+/* True while a client still has a file or the root directory open */
+bool uki_fs_busy(const uki_context_t *ctx) {
+    if (ctx->root && ctx->root->entry && ctx->root->entry->attr.count > 0) {
+	return true;
+    }
+
+    for (size_t i = 0; i < ctx->hash_table_size; i++) {
+	for (const uki_entry_t *entry = ctx->hash_table[i]; entry;
+	     entry = entry->next) {
+	    if (entry->attr.count > 0) {
+		DEBUG_LOG("'%s' is still open (%d)", entry->name,
+			  (int)entry->attr.count);
+		return true;
+	    }
+	}
+    }
+
+    return false;
+}
+
 /* Custom OCB allocator */
 static IOFUNC_OCB_T *uki_ocb_calloc(resmgr_context_t *ctp UNUSED, IOFUNC_ATTR_T *attr) {
     DEBUG_LOG("Allocating uki_ocb_t (size=%zu)", sizeof(uki_ocb_t));
@@ -435,6 +500,13 @@ int main(int argc, char *argv[]) {
 
     /* Parse arguments */
     if (parse_arguments(argc, argv, ctx) != 0) {
+        free(ctx);
+        return EXIT_FAILURE;
+    }
+
+    /* Shutdown request, from a signal or from umount */
+    if (sem_init(&g_shutdown_sem, 0, 0) != 0) {
+        ERROR_LOG("Failed to create the shutdown semaphore: %s", strerror(errno));
         free(ctx);
         return EXIT_FAILURE;
     }
@@ -576,6 +648,7 @@ int main(int argc, char *argv[]) {
 
     /* Override connect functions */
     connect_funcs.open = uki_open;
+    connect_funcs.mount = uki_mount;
 
     /* Override I/O functions */
     io_funcs.read = uki_read;
@@ -657,7 +730,11 @@ int main(int argc, char *argv[]) {
     ctx->pool_attr.maximum = 10;
 
     /* Create and start thread pool */
-    ctx->tpool = thread_pool_create(&ctx->pool_attr, POOL_FLAG_EXIT_SELF);
+    /* No POOL_FLAG_EXIT_SELF / POOL_FLAG_USE_SELF: thread_pool_start()
+     * must return, so that this thread stays around to wait for the
+     * shutdown request and tear the filesystem down. With
+     * POOL_FLAG_EXIT_SELF it would terminate the calling thread. */
+    ctx->tpool = thread_pool_create(&ctx->pool_attr, 0);
     if (!ctx->tpool) {
         ERROR_LOG("Failed to create thread pool: %s", strerror(errno));
         cleanup(ctx);
@@ -676,12 +753,23 @@ int main(int argc, char *argv[]) {
     INFO_LOG("UKI filesystem ready at %s", ctx->mount_point);
     DEBUG_LOG("=== UKIFS INITIALIZED SUCCESSFULLY ===");
 
-    /* Main loop - thread pool handles all requests, just wait for signal */
-    pause();
+    /* The thread pool serves the requests. Wait until a signal or an
+     * unmount asks for the filesystem to go away. */
+    while (sem_wait(&g_shutdown_sem) != 0) {
+        if (errno != EINTR) {
+            ERROR_LOG("Failed to wait for the shutdown request: %s",
+                      strerror(errno));
+            break;
+        }
+    }
 
-    /* Should never reach here (signal handler exits) */
-    cleanup(ctx);
+    if (g_shutdown_signal != 0) {
+        INFO_LOG("Received signal %d, shutting down", (int)g_shutdown_signal);
+    }
+
+    shutdown_fs(ctx);
     free(ctx);
+    g_ctx = NULL;
 
     DEBUG_LOG("=== UKIFS EXITING ===");
     return EXIT_SUCCESS;

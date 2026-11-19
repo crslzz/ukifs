@@ -95,6 +95,12 @@ typedef struct uki_ocb {
     dir_node_t *dir_node;          /* Directory being read (if S_ISDIR) */
 } uki_ocb_t;
 
+/* Ask the main thread to unmount the filesystem and exit */
+void uki_request_shutdown(void);
+
+/* True while a client still has a file or the root directory open */
+bool uki_fs_busy(const struct uki_context *ctx);
+
 /*
  * Get the UKI context from the mount structure in the OCB
  */
