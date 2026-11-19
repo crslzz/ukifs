@@ -353,16 +353,63 @@ else
 fi
 
 # A signed UKI and its certificate, if the caller provides them, cover
-# verification on a plain file
+# the authentication of a UKI. The image of a target may well carry an
+# unsigned UKI, which cannot cover any of this.
 if [ -n "${SIGNED_UKI:-}" ] && [ -n "${CERT:-}" ]; then
     echo
-    echo "=== 11. Signature verification on a plain UKI file ==="
+    echo "=== 11. Authentication ==="
+
     if start_ukifs_src $SIGNED_UKI --cert $CERT; then
-	grep "verified" $LOG
-	ok "a signed UKI file mounts with its certificate"
+	ok "a signed UKI mounts with its certificate"
+	grep "verified successfully" $LOG
 	stop_ukifs
     else
-	bad "a signed UKI file did not mount with its certificate"
+	bad "a signed UKI did not mount with its certificate"
+    fi
+
+    # A file that is not a certificate at all must be refused. The UKI
+    # itself does the job and needs no second artifact.
+    if start_ukifs_src $SIGNED_UKI --cert $SIGNED_UKI; then
+	bad "a signed UKI mounted with a file that is not a certificate"
+	stop_ukifs
+    else
+	ok "a UKI is refused when the certificate cannot be read"
+	grep -e "Failed to parse" -e "verification failed" $LOG
+    fi
+
+    # A valid certificate from another authority must be refused too.
+    # That is a different path: the digest matches, the signer does not.
+    if [ -n "${WRONG_CERT:-}" ]; then
+	if start_ukifs_src $SIGNED_UKI --cert $WRONG_CERT; then
+	    bad "a signed UKI mounted with a certificate of another authority"
+	    stop_ukifs
+	else
+	    ok "a UKI is refused when it was signed by another authority"
+	    grep -e "Signer certificate" $LOG
+	fi
+    fi
+
+    # A single modified byte in the UKI has to break the signature
+    TAMPERED=/tmp/ukifs_tampered.efi
+    cp $SIGNED_UKI $TAMPERED
+    dd if=/dev/zero of=$TAMPERED bs=1 seek=100000 count=1 conv=notrunc 2>/dev/null
+
+    if start_ukifs_src $TAMPERED --cert $CERT; then
+	bad "a tampered UKI mounted"
+	stop_ukifs
+    else
+	ok "a tampered UKI is refused"
+	grep "hash mismatch" $LOG
+    fi
+
+    rm -f $TAMPERED
+
+    # Without a certificate the UKI is served unverified, as documented
+    if start_ukifs_src $SIGNED_UKI; then
+	ok "a signed UKI mounts unverified when no certificate is given"
+	stop_ukifs
+    else
+	bad "a signed UKI did not mount without a certificate"
     fi
 fi
 
