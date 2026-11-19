@@ -285,3 +285,15 @@ file (nothing when extracting to stdout), so it can be used in scripts:
 UKI=$(./ukiextract --slot auto disk.img) || exit 1
 ```
 
+## Testing
+
+Host test programs are built with `make tests`; see [TESTING.md](TESTING.md).
+The ukiboot slot support can be exercised on Linux with:
+
+```bash
+make test-slot utils
+./test_slot_demo.sh      # builds GPT and MBR ukiboot images, resolves the slots,
+                         # and checks that ukiextract gives the UKIs back byte for byte
+sudo ./test_blkdev.sh    # puts a ukiboot image in a partition of a loop device
+                         # and reads it back through the block device
+```

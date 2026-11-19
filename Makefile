@@ -226,11 +226,11 @@ ukiextract: $(UKIEXTRACT_SRCS) \
 
 # Host test programs
 .PHONY: tests
-tests: test-verify test-size
+tests: test-verify test-size test-slot
 	@echo "All test programs built"
 
 clean-tests:
-	rm -f test_verify test_size
+	rm -f test_verify test_size test_slot
 
 .PHONY: test-verify
 test-verify: test_verify
@@ -270,3 +270,26 @@ test_size: test_size.c \
 	    -I. -I$(UKIBOOT) -I$(COMPAT)
 	@echo "Build complete: test_size"
 
+.PHONY: test-slot
+test-slot: test_slot
+	@echo "Test program built: test_slot"
+	@echo "Usage: ./test_slot [--bootctl <path>] <disk-image> [a|b|auto]"
+
+test_slot: test_slot.c \
+	   ukifs_slot.c ukifs_slot.h \
+	   ukifs_size.c ukifs_size.h \
+	   ukifs_utils.h \
+	   $(UKIBOOT)/gpt_parser.c $(UKIBOOT)/gpt_parser.h \
+	   $(UKIBOOT)/bootctl.h \
+	   $(UKIBOOT)/pe_parser_posix.c $(UKIBOOT)/pe_parser_posix.h \
+	   $(UKIBOOT)/utils.c $(UKIBOOT)/utils.h $(COMPAT)/config.h
+	@echo "Building ukiboot slot selection test..."
+	gcc -o test_slot \
+	    test_slot.c ukifs_slot.c ukifs_size.c \
+	    $(UKIBOOT)/gpt_parser.c \
+	    $(UKIBOOT)/pe_parser_posix.c \
+	    $(UKIBOOT)/utils.c \
+	    -Wall -Wextra -O2 -g \
+	    -I. -I$(UKIBOOT) -I$(COMPAT) \
+	    $(LIBS)
+	@echo "Build complete: test_slot"
