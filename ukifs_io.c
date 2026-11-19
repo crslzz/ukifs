@@ -12,11 +12,33 @@
 
 #include "utils.h"
 
-/* Largest reply served from a temporary buffer when the UKI is not mapped */
-#define UKI_READ_CHUNK_MAX (1024 * 1024)
+/*
+ * Scratch buffer used to serve a read when the UKI is not mapped, and
+ * to build directory entries.
+ *
+ * One buffer per thread, allocated once: a pool thread serves a single
+ * request at a time, so no locking is needed, nothing is allocated per
+ * request, and the memory stays bounded by the size of the pool. Reads
+ * larger than the buffer are streamed to the client chunk by chunk.
+ */
+#define UKI_SCRATCH_SIZE (64 * 1024)
 
 /* Largest batch of directory entries returned by a single readdir */
 #define UKI_DIRENT_BUF_SIZE 4096
+
+static __thread void *uki_scratch = NULL;
+
+static void *scratch_buffer(void) {
+    if (!uki_scratch) {
+        uki_scratch = malloc(UKI_SCRATCH_SIZE);
+        if (!uki_scratch) {
+            ERROR_LOG("Failed to allocate the %d byte scratch buffer",
+                      UKI_SCRATCH_SIZE);
+        }
+    }
+
+    return uki_scratch;
+}
 
 /*
  * Open callback - handles path resolution and file opening
@@ -176,10 +198,9 @@ static int uki_readdir(resmgr_context_t *ctp, io_read_t *msg, uki_ocb_t *ocb) {
         return _RESMGR_NPARTS(0);
     }
 
-    /* Build dirent structures in a buffer */
-    char *buffer = malloc(capacity);
+    /* Build the dirent structures in the scratch buffer of this thread */
+    char *buffer = scratch_buffer();
     if (!buffer) {
-        DEBUG_LOG("Failed to allocate buffer");
         DEBUG_EXIT(ENOMEM);
         return ENOMEM;
     }
@@ -237,19 +258,16 @@ static int uki_readdir(resmgr_context_t *ctp, io_read_t *msg, uki_ocb_t *ocb) {
     if (buf_used == 0) {
         /* Not even one entry fits in the buffer of the client */
         DEBUG_LOG("Buffer too small for a directory entry (%zu bytes)", capacity);
-        free(buffer);
         DEBUG_EXIT(EINVAL);
         return EINVAL;
     }
 
-    /* Hand the entries to the client, then release the buffer. Using
-     * SETIOV() here would need the buffer to outlive this function, as
-     * the framework only replies once it returns. */
+    /* Hand the entries to the client. Using SETIOV() here would need
+     * the buffer to outlive this function, as the framework only
+     * replies once it returns. */
     DEBUG_VAL("buf_used", buf_used);
 
     ssize_t written = resmgr_msgwrite(ctp, buffer, buf_used, 0);
-
-    free(buffer);
 
     if (written < 0 || (size_t)written != buf_used) {
         ERROR_LOG("[READDIR] failed to return %zu bytes: %s",
@@ -275,71 +293,70 @@ static int uki_readdir(resmgr_context_t *ctp, io_read_t *msg, uki_ocb_t *ocb) {
 /*
  * Serve a read when the UKI is not mapped.
  *
- * Block devices usually cannot be mmap'd, so the data is read from the
- * device into a temporary buffer. The buffer is copied to the client
- * with resmgr_msgwrite() while the request is being handled, rather
- * than handed to the framework with SETIOV(), which would require the
- * buffer to stay alive after this function returns. resmgr_msgwrite()
- * also places the data at the right offset of the reply, so reads that
- * are part of a combine message keep working.
+ * The data is read from the source into the scratch buffer of this
+ * thread and copied to the client with resmgr_msgwrite() while the
+ * request is being handled, rather than handed to the framework with
+ * SETIOV(), which would require the buffer to stay alive after this
+ * function returns. resmgr_msgwrite() places the data at the right
+ * offset of the reply, which both lets a large read be streamed in
+ * several chunks and keeps combine messages working.
  */
 static int uki_read_unmapped(resmgr_context_t *ctp, uki_ocb_t *ocb,
                              uki_context_t *ctx, uint32_t file_position,
                              size_t nbytes) {
     DEBUG_ENTER();
 
-    /* Bound the size of a single reply: a short read is legal, and this
-     * keeps a huge request from allocating a huge buffer */
-    if (nbytes > UKI_READ_CHUNK_MAX) {
-        DEBUG_LOG("[READ] clamping unmapped read from %zu to %u bytes",
-                  nbytes, UKI_READ_CHUNK_MAX);
-        nbytes = UKI_READ_CHUNK_MAX;
-    }
-
-    void *buffer = malloc(nbytes);
+    void *buffer = scratch_buffer();
     if (!buffer) {
-        ERROR_LOG("[READ] file='%s' failed to allocate %zu bytes",
-                  ocb->entry->name, nbytes);
         DEBUG_EXIT(ENOMEM);
         return ENOMEM;
     }
 
     off_t position = ctx->uki_offset + (off_t)file_position;
+    size_t done = 0;
 
-    if (!full_pread(ctx->uki_fd, buffer, nbytes, position)) {
-        ERROR_LOG("[READ] file='%s' failed to read %zu bytes at offset %lld",
-                  ocb->entry->name, nbytes, (long long)position);
-        free(buffer);
-        DEBUG_EXIT(EIO);
-        return EIO;
+    /* Stream the data to the client, a scratch buffer at a time, so
+     * that a large request neither allocates nor is cut short */
+    while (done < nbytes) {
+        size_t chunk = nbytes - done;
+
+        if (chunk > UKI_SCRATCH_SIZE) {
+            chunk = UKI_SCRATCH_SIZE;
+        }
+
+        if (!full_pread(ctx->uki_fd, buffer, chunk, position + (off_t)done)) {
+            ERROR_LOG("[READ] file='%s' failed to read %zu bytes at offset %lld",
+                      ocb->entry->name, chunk, (long long)(position + done));
+            DEBUG_EXIT(EIO);
+            return EIO;
+        }
+
+        ssize_t written = resmgr_msgwrite(ctp, buffer, chunk, done);
+
+        if (written < 0 || (size_t)written != chunk) {
+            ERROR_LOG("[READ] file='%s' failed to return %zu bytes: %s",
+                      ocb->entry->name, chunk, strerror(errno));
+            DEBUG_EXIT(EIO);
+            return EIO;
+        }
+
+        done += chunk;
     }
 
     DEBUG_LOG("[READ] file='%s' read %zu bytes at device offset %lld",
-              ocb->entry->name, nbytes, (long long)position);
-
-    /* Hand the data to the client, then release the buffer */
-    ssize_t written = resmgr_msgwrite(ctp, buffer, nbytes, 0);
-
-    free(buffer);
-
-    if (written < 0 || (size_t)written != nbytes) {
-        ERROR_LOG("[READ] file='%s' failed to return %zu bytes: %s",
-                  ocb->entry->name, nbytes, strerror(errno));
-        DEBUG_EXIT(EIO);
-        return EIO;
-    }
+              ocb->entry->name, done, (long long)position);
 
     /* Update offset for next read */
-    ocb->ocb.offset += nbytes;
+    ocb->ocb.offset += done;
 
     /* Mark as read */
     if (ocb->ocb.attr) {
         ocb->ocb.attr->flags |= IOFUNC_ATTR_ATIME;
     }
 
-    _IO_SET_READ_NBYTES(ctp, nbytes);
+    _IO_SET_READ_NBYTES(ctp, done);
 
-    DEBUG_VAL("returning nbytes", nbytes);
+    DEBUG_VAL("returning nbytes", done);
     DEBUG_EXIT(0);
     return _RESMGR_NPARTS(0);
 }
