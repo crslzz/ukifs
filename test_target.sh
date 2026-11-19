@@ -45,20 +45,26 @@ bad() {
     failures=$((failures + 1))
 }
 
-start_ukifs() {
-    # $@: extra ukifs options
+start_ukifs_src() {
+    # $1: what to mount, $@: extra ukifs options
     # A stopped instance may still write to its log, so give each run
     # its own file rather than truncating one under its feet
+    src=$1
+    shift
     runs=$((runs + 1))
     LOG=$LOGBASE.$runs.log
-    $UKIFS -v "$@" $DEV $MNT > $LOG 2>&1 &
-    waitfor $MNT 10 > /dev/null 2>&1
+    $UKIFS -v "$@" $src $MNT > $LOG 2>&1 &
+    waitfor $MNT 60 > /dev/null 2>&1
     if [ ! -d $MNT ]; then
 	echo "--- ukifs log ---"
 	cat $LOG
 	return 1
     fi
     return 0
+}
+
+start_ukifs() {
+    start_ukifs_src $DEV "$@"
 }
 
 ukifs_running() {
@@ -280,6 +286,84 @@ if start_ukifs --slot auto; then
     fi
 else
     bad "filesystem did not attach for the forced unmount test"
+fi
+
+echo
+echo "=== 10. Plain UKI file, without a slot ==="
+#
+# The UKI of the slot is copied out and mounted as an ordinary file, so
+# that the path ukifs takes when it is given a UKI rather than a ukiboot
+# image is covered, and so that both paths can be shown to serve exactly
+# the same bytes.
+#
+UKI_FILE=/tmp/ukifs_plain.efi
+
+if start_ukifs --slot auto; then
+    uki_size=`grep "UKI size:" $LOG | sed -e "s/.*UKI size: \([0-9]*\) bytes.*/\1/"`
+    slot_off=`grep "Using ukiboot slot" $LOG | sed -e "s/.*at offset \([0-9]*\).*/\1/"`
+    stop_ukifs
+
+    if [ -z "$uki_size" ] || [ -z "$slot_off" ]; then
+	bad "could not read the UKI size and offset from the log"
+    else
+	echo "copying $uki_size bytes from offset $slot_off into $UKI_FILE"
+	dd if=$DEV of=$UKI_FILE bs=512 skip=$((slot_off / 512)) \
+	   count=$(((uki_size + 511) / 512)) 2>/dev/null
+
+	if start_ukifs_src $UKI_FILE; then
+	    ok "a plain UKI file mounts without a slot"
+	    grep -e "Source:" -e "Mapped" $LOG
+
+	    checksum_sections $SUMS.plain
+	    if [ "`cksum < $SUMS.mapped`" = "`cksum < $SUMS.plain`" ]; then
+		ok "the file and the slot serve identical data"
+	    else
+		bad "the file and the slot differ"
+		echo "--- slot ---"; cat $SUMS.mapped
+		echo "--- file ---"; cat $SUMS.plain
+	    fi
+	    stop_ukifs
+	else
+	    bad "a plain UKI file did not mount"
+	fi
+
+	if start_ukifs_src $UKI_FILE --no-mmap; then
+	    checksum_sections $SUMS.plain_pread
+	    if [ "`cksum < $SUMS.mapped`" = "`cksum < $SUMS.plain_pread`" ]; then
+		ok "a plain UKI file read with pread() serves identical data"
+	    else
+		bad "pread() on a plain UKI file differs from the slot"
+	    fi
+	    stop_ukifs
+	else
+	    bad "a plain UKI file did not mount with --no-mmap"
+	fi
+
+	if start_ukifs_src $UKI_FILE --eager-map; then
+	    ok "a plain UKI file mounts with --eager-map"
+	    stop_ukifs
+	else
+	    bad "a plain UKI file did not mount with --eager-map"
+	fi
+    fi
+
+    rm -f $UKI_FILE
+else
+    bad "the slot did not mount, cannot extract a plain UKI file"
+fi
+
+# A signed UKI and its certificate, if the caller provides them, cover
+# verification on a plain file
+if [ -n "${SIGNED_UKI:-}" ] && [ -n "${CERT:-}" ]; then
+    echo
+    echo "=== 11. Signature verification on a plain UKI file ==="
+    if start_ukifs_src $SIGNED_UKI --cert $CERT; then
+	grep "verified" $LOG
+	ok "a signed UKI file mounts with its certificate"
+	stop_ukifs
+    else
+	bad "a signed UKI file did not mount with its certificate"
+    fi
 fi
 
 echo
