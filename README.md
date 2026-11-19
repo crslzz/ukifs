@@ -4,6 +4,8 @@
 
 `ukifs` is a virtual filesystem for QNX that allows presenting the different sections of a Unified Kernel Image (UKI) as individual files. The UKI can be a plain file or one of the two A/B slots of a [ukiboot](https://gitlab.com/CentOS/automotive/src/ukiboot) disk image.
 
+The repository also provides `ukiextract`, a standalone Linux utility that extracts the UKI of a ukiboot slot using the same code.
+
 ## Purpose
 
 This program mounts a UKI as a read-only filesystem. This allows passing individual OS artifacts (typically, the Linux kernel, initial ramdisk, and kernel command-line) directly to QNX's qvm virtual machine manager. Files integrity is ensured via the verification of the UKI's signature.
@@ -19,6 +21,13 @@ UKIBOOT=/path/to/ukiboot QNX_SDP=/path/to/qnx/sdp make
 ```
 
 This creates `ukifs` (x86_64) and `ukifs.aarch64` executables for QNX.
+
+The companion Linux utility `ukiextract` (see [Extracting a UKI on
+Linux](#extracting-a-uki-on-linux-ukiextract)) is built for the host with:
+
+```bash
+UKIBOOT=/path/to/ukiboot QNX_SDP=/path/to/qnx/sdp make utils
+```
 
 ## Usage
 
@@ -202,5 +211,77 @@ $ ukifs -v --slot auto /dev/sd0t131 /mnt/uki
 [INFO] Ignoring 69025280 bytes of padding after the UKI (51.4%)
 [INFO] Parsed 11 sections from UKI file
 [INFO] Attaching resource manager at /mnt/uki
+```
+
+## Extracting a UKI on Linux (ukiextract)
+
+`ukiextract` is a standalone Linux utility that extracts the UKI stored in a
+ukiboot slot, for instance to inspect it, archive it, or feed it to a tool that
+expects a plain UKI file. It shares all of its logic with the QNX driver: the
+same `ukifs_slot.c` for the partition table and the `ukibootctl` content, the
+same `ukifs_size.c` for the size of the UKI, and the same ukiboot PE parser for
+the sections and the signature. It therefore extracts exactly the UKI that
+`ukifs` would mount and that ukiboot would boot.
+
+```bash
+./ukiextract [options] <ukiboot-image>
+```
+
+### Options
+-  `-s <a|b|auto>`, `--slot`  - Slot to extract (default: `auto`)
+-  `-A`, `--slot-a`           - Same as `--slot a`
+-  `-B`, `--slot-b`           - Same as `--slot b`
+-  `--bootctl <path>`         - Standalone `ukibootctl` partition to use for `--slot auto`
+-  `-o <path>`, `--output`    - Output file, `-` for stdout (default: `ukiboot_a.efi` / `ukiboot_b.efi`)
+-  `-c <cert.pem>`, `--cert`  - Verify the UKI signature before extracting
+-  `--whole-slot`             - Extract the whole slot partition, padding included
+-  `-v`, `--verbose`          - Verbose mode (info messages)
+-  `-d <level>`, `--debug`    - Debug level: 0=quiet, 1=errors, 2=info, 3=debug
+-  `-h`, `--help`             - Show this help
+
+By default only the UKI itself is written out: its size is computed from the PE
+headers (headers, sections and certificate table), so the padding of the slot
+partition is left behind and the extracted file is byte-identical to the UKI
+that was installed in the slot.
+
+### Examples
+
+```bash
+# Active slot of a disk image or disk, as ukiboot would select it
+./ukiextract disk.img                       # writes ukiboot_a.efi or ukiboot_b.efi
+./ukiextract /dev/sda -o /tmp/active.efi
+
+# A specific slot, verified against a certificate before extraction
+./ukiextract --slot-b --cert rootCA.crt -o slot_b.efi disk.img
+
+# Boot control data on its own device
+./ukiextract --bootctl /dev/sda4 -o active.efi /dev/sda
+
+# ukiboot image stored in a partition, read through its block device
+./ukiextract --slot auto -o active.efi /dev/sda1
+
+# Pipe the UKI somewhere else
+./ukiextract -o - disk.img | sha256sum
+
+# The complete slot partition, padding included
+./ukiextract --slot a --whole-slot -o slot_a_raw.img disk.img
+```
+
+```bash
+$ ./ukiextract -v disk.img
+[INFO] Reading GPT partition table
+[INFO] ukibootctl slot a: priority=15 tries_remaining=7 successful_boot=0
+[INFO] ukibootctl slot b: priority=14 tries_remaining=7 successful_boot=0
+[INFO] Active ukiboot slot: a
+[INFO] ukiboot slot a: offset 105906176, size 134217728 bytes
+[INFO] UKI size: 65192448 bytes (69025280 bytes of padding ignored)
+[INFO] Extracted 65192448 bytes from slot a of 'disk.img' to 'ukiboot_a.efi'
+```
+
+Without `-v`, the utility is silent and prints only the path of the extracted
+file (nothing when extracting to stdout), so it can be used in scripts:
+
+```bash
+UKI=$(./ukiextract --slot auto disk.img) || exit 1
 ```
 

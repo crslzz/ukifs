@@ -139,6 +139,7 @@ clean:
 	@$(MAKE) clean-arch ARCH=x86_64
 	@$(MAKE) clean-arch ARCH=aarch64
 	@$(MAKE) clean-tests
+	@$(MAKE) clean-utils
 	@echo "Clean complete"
 
 # Clean specific architecture
@@ -181,6 +182,7 @@ help:
 	@echo "Build Targets:"
 	@echo "	 all	      - Build for current ARCH (default: x86_64)"
 	@echo "	 all-archs    - Build for all supported architectures"
+	@echo "	 utils	      - Build host (Linux) utilities: ukiextract"
 	@echo "	 clean	      - Remove all build artifacts"
 	@echo "	 clean-arch   - Remove artifacts for current ARCH only"
 	@echo ""
@@ -191,7 +193,36 @@ help:
 	@echo "Usage Examples:"
 	@echo "	 make	       # Build for all architectures"
 	@echo "	 make tests    # Build all test programs"
+	@echo "	 make utils    # Build the Linux ukiextract utility"
 	@echo "	 make clean    # Clean all artifacts"
+
+# Host (Linux) utilities
+.PHONY: utils
+utils: ukiextract
+	@echo "Host utilities built"
+
+clean-utils:
+	rm -f ukiextract
+
+UKIEXTRACT_SRCS = ukiextract.c \
+		  ukifs_slot.c \
+		  ukifs_size.c \
+		  $(UKIBOOT)/gpt_parser.c \
+		  $(UKIBOOT)/pe_parser_posix.c \
+		  $(UKIBOOT)/utils.c
+
+ukiextract: $(UKIEXTRACT_SRCS) \
+	    ukifs_slot.h ukifs_size.h ukifs_utils.h \
+	    $(UKIBOOT)/gpt_parser.h $(UKIBOOT)/bootctl.h \
+	    $(UKIBOOT)/pe_parser_posix.h $(UKIBOOT)/utils.h \
+	    $(COMPAT)/config.h
+	@echo "Building the ukiboot UKI extraction utility..."
+	gcc -o ukiextract \
+	    $(UKIEXTRACT_SRCS) \
+	    -Wall -Wextra -O2 -g \
+	    -I. -I$(UKIBOOT) -I$(COMPAT) \
+	    $(LIBS)
+	@echo "Build complete: ukiextract"
 
 # Host test programs
 .PHONY: tests
