@@ -28,6 +28,7 @@ export PATH
 UKIFS=${UKIFS:-/tmp/ukifs}
 DEV=${DEV:-/dev/sd0t131}
 MNT=${MNT:-/mnt/uki}
+UKIFS_NAME=${UKIFS##*/}
 LOGBASE=/tmp/ukifs_test
 LOG=$LOGBASE.0.log
 SUMS=/tmp/ukifs_sums
@@ -58,6 +59,16 @@ start_ukifs() {
 	return 1
     fi
     return 0
+}
+
+ukifs_running() {
+    # pidin prints process names without their leading slash and padded
+    # with spaces, so /tmp/ukifs shows up as "tmp/ukifs    "
+    pidin -F "%n" 2>/dev/null | grep "/$UKIFS_NAME *\$" > /dev/null 2>&1
+}
+
+watchdog_fired() {
+    grep -e "timed out" -e "Forced shutdown" $LOG > /dev/null 2>&1
 }
 
 stop_ukifs() {
@@ -175,6 +186,101 @@ for slot in a b; do
 	grep ERROR $LOG
     fi
 done
+
+echo
+echo "=== 9. Unmounting ==="
+if start_ukifs --slot auto; then
+    # A client holding a file open must keep the filesystem mounted
+    exec 3< $MNT/uname
+    umount $MNT > /dev/null 2>&1
+    if [ $? -ne 0 ]; then
+	ok "umount refused while a file is open"
+    else
+	bad "umount accepted while a file is open"
+    fi
+
+    exec 3<&-
+    umount $MNT > /dev/null 2>&1
+    if [ $? -eq 0 ]; then
+	ok "umount accepted once the file is closed"
+    else
+	bad "umount refused after the file was closed"
+    fi
+
+    sleep 1
+    if [ -d $MNT ]; then
+	bad "$MNT is still there after umount"
+    else
+	ok "$MNT is gone after umount"
+    fi
+
+    if ukifs_running; then
+	bad "ukifs is still running after umount"
+    else
+	ok "ukifs exited after umount"
+    fi
+
+    if watchdog_fired; then
+	bad "shutdown did not complete in time"
+	grep -e "timed out" -e "Forced shutdown" $LOG
+    else
+	ok "shutdown completed without the watchdog firing"
+    fi
+else
+    bad "filesystem did not attach for the unmount test"
+fi
+
+if start_ukifs --slot auto; then
+    if ukifs_running; then
+	ok "ukifs is running before the signal test"
+    else
+	bad "ukifs is not running before the signal test"
+    fi
+
+    slay -f ukifs > /dev/null 2>&1
+    sleep 2
+
+    if [ -d $MNT ]; then
+	bad "$MNT is still there after SIGTERM"
+    else
+	ok "$MNT is gone after SIGTERM"
+    fi
+
+    if ukifs_running; then
+	bad "ukifs is still running after SIGTERM"
+    else
+	ok "ukifs exited on SIGTERM"
+    fi
+
+    if watchdog_fired; then
+	bad "SIGTERM shutdown did not complete in time"
+	grep -e "timed out" -e "Forced shutdown" $LOG
+    else
+	ok "SIGTERM shutdown completed without the watchdog firing"
+    fi
+else
+    bad "filesystem did not attach for the signal test"
+fi
+
+if start_ukifs --slot auto; then
+    exec 3< $MNT/linux
+    umount -f $MNT > /dev/null 2>&1
+    if [ $? -eq 0 ]; then
+	ok "umount -f accepted while a file is open"
+    else
+	bad "umount -f refused while a file is open"
+    fi
+    exec 3<&-
+    sleep 1
+
+    if ukifs_running; then
+	bad "ukifs is still running after umount -f"
+    else
+	ok "ukifs exited after umount -f"
+    fi
+else
+    bad "filesystem did not attach for the forced unmount test"
+fi
 
 echo
 if [ $failures -ne 0 ]; then

@@ -272,6 +272,11 @@ does partial and seeking reads, checks that the filesystem is read-only,
 and mounts the same slot again with `--no-mmap` to confirm that the data
 served from the mapping and the data read with `pread()` are identical.
 
+It then covers the shutdown paths: `umount` is refused while a file is
+open and accepted once it is closed, `umount -f` is accepted either way,
+`slay` does the same through SIGTERM, and in each case the mountpoint is
+gone, the process has exited, and the shutdown watchdog did not fire.
+
 ### 8. Integration Testing
 
 ```bash
