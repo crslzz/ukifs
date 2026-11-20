@@ -414,6 +414,75 @@ if [ -n "${SIGNED_UKI:-}" ] && [ -n "${CERT:-}" ]; then
 fi
 
 echo
+echo "=== 12. Background mode ==="
+#
+# A -b that never returns would hang the test, so a watchdog cuts it
+# short; the marker keeps the watchdog from touching a later run.
+#
+# ':' and a redirection create the marker; there is no touch here
+: > /tmp/ukifs_bg_marker
+( sleep 30
+  if [ -f /tmp/ukifs_bg_marker ]; then
+      slay -f ukifs > /dev/null 2>&1
+  fi ) &
+
+runs=$((runs + 1))
+LOG=$LOGBASE.$runs.log
+$UKIFS -b -v --slot auto $DEV $MNT > $LOG 2>&1
+rc=$?
+rm -f /tmp/ukifs_bg_marker
+
+if [ $rc -eq 0 ]; then
+    ok "ukifs -b returned 0"
+else
+    bad "ukifs -b returned $rc"
+    cat $LOG
+fi
+
+if [ -d $MNT ]; then
+    ok "the filesystem is already serving when -b returns"
+else
+    bad "$MNT is not there when -b returns"
+fi
+
+if ukifs_running; then
+    ok "ukifs kept running in the background"
+else
+    bad "ukifs did not stay in the background"
+fi
+
+if cat $MNT/uname > /dev/null 2>&1; then
+    ok "sections are readable from the backgrounded filesystem"
+else
+    bad "sections are not readable from the backgrounded filesystem"
+fi
+
+if grep "ready at" $LOG > /dev/null 2>&1; then
+    ok "a redirected log keeps its contents in background mode"
+else
+    bad "the redirected log is empty in background mode"
+fi
+
+umount $MNT > /dev/null 2>&1
+sleep 1
+
+# What -b buys over "& and waitfor": a mount that fails says so
+$UKIFS -b --slot b $DEV $MNT > /dev/null 2>&1
+rc=$?
+if [ $rc -ne 0 ]; then
+    ok "-b reports a mount that failed with a status ($rc)"
+else
+    bad "-b returned 0 although the slot cannot be mounted"
+    umount $MNT > /dev/null 2>&1
+fi
+
+if [ -d $MNT ]; then
+    bad "$MNT is there after a failed -b"
+else
+    ok "nothing is left behind by a failed -b"
+fi
+
+echo
 if [ $failures -ne 0 ]; then
     echo "=== $failures check(s) FAILED ==="
     exit 1

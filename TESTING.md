@@ -277,7 +277,12 @@ open and accepted once it is closed, `umount -f` is accepted either way,
 `slay` does the same through SIGTERM, and in each case the mountpoint is
 gone, the process has exited, and the shutdown watchdog did not fire.
 
-Finally it copies the UKI out of the slot with `dd` and mounts it as a
+It also covers `-b`: that the command returns only once the filesystem is
+serving, that the process stays in the background, that a redirected log
+keeps its contents, and that a mount which cannot succeed comes back as a
+non-zero status rather than a timeout.
+
+It copies the UKI out of the slot with `dd` and mounts it as a
 plain file, with no slot option, and checks that the file and the slot
 serve byte-identical sections; that is repeated with `--no-mmap` and
 `--eager-map`. Passing `SIGNED_UKI` and `CERT` adds a signed UKI file
