@@ -9,6 +9,7 @@
 #include <string.h>
 #include <time.h>
 #include <sys/mman.h>
+#include <sys/procmgr.h>
 #include <sys/dispatch.h>
 
 #include "ukifs_core.h"
@@ -165,6 +166,9 @@ static void usage(const char *argv0) {
     fprintf(stderr, "                      the UKI is read: mounting takes as long as reading\n");
     fprintf(stderr, "                      the whole UKI, but reads never wait for the device\n");
     fprintf(stderr, "                      afterwards and cannot fail on a memory shortage\n");
+    fprintf(stderr, "  -b, --background    Detach once the filesystem is attached, so that the\n");
+    fprintf(stderr, "                      command returns when the mountpoint is usable, with a\n");
+    fprintf(stderr, "                      status saying whether mounting succeeded\n");
     fprintf(stderr, "  -h, --help          Show this help\n");
     fprintf(stderr, "\n");
     fprintf(stderr, "Examples:\n");
@@ -175,6 +179,7 @@ static void usage(const char *argv0) {
     fprintf(stderr, "  %s --slot auto /dev/hd0 /mnt/uki    # Active slot of a ukiboot disk\n", argv0);
     fprintf(stderr, "  %s --slot-b /tmp/ukiboot.img /mnt/uki\n", argv0);
     fprintf(stderr, "  %s --slot auto /dev/hd1t179 /mnt/uki # ukiboot image in a partition\n", argv0);
+    fprintf(stderr, "  %s -b --slot auto /dev/hd0 /mnt/uki && qvm ...\n", argv0);
 }
 
 /* Parse command line arguments */
@@ -195,6 +200,7 @@ static int parse_arguments(int argc, char *argv[], uki_context_t *ctx) {
 	{"bootctl", required_argument, NULL, OPT_BOOTCTL},
 	{"no-mmap",  no_argument,      NULL, OPT_NO_MMAP},
 	{"eager-map", no_argument,     NULL, OPT_EAGER_MAP},
+	{"background", no_argument,    NULL, 'b'},
 	{"help",    no_argument,       NULL, 'h'},
 	{NULL,      0,                 NULL, 0},
     };
@@ -204,11 +210,13 @@ static int parse_arguments(int argc, char *argv[], uki_context_t *ctx) {
     ctx->bootctl_path = NULL;
     ctx->no_mmap = false;
     ctx->eager_map = false;
+    ctx->background = false;
+    ctx->ready_fd = -1;
     ctx->slot_sel = UKI_SLOT_SEL_NONE;
     ctx->slot = -1;
 
     /* Parse options */
-    while ((opt = getopt_long(argc, argv, "vp:d:c:s:ABh",
+    while ((opt = getopt_long(argc, argv, "vp:d:c:s:ABbh",
 			      long_options, NULL)) != -1) {
         switch (opt) {
 	case 'v':
@@ -240,6 +248,9 @@ static int parse_arguments(int argc, char *argv[], uki_context_t *ctx) {
 	    break;
 	case 'A':
 	    ctx->slot_sel = UKI_SLOT_SEL_A;
+	    break;
+	case 'b':
+	    ctx->background = true;
 	    break;
 	case 'B':
 	    ctx->slot_sel = UKI_SLOT_SEL_B;
@@ -289,6 +300,91 @@ static int parse_arguments(int argc, char *argv[], uki_context_t *ctx) {
     DEBUG_STR("Mount point", ctx->mount_point);
 
     return 0;
+}
+
+/*
+ * Go to the background, keeping the parent around until the filesystem
+ * is either serving or known to have failed.
+ *
+ * The fork happens before anything is opened, as neither the channel of
+ * the resource manager nor the threads of its pool would survive it.
+ * The child reports success through a pipe; if it dies first, the
+ * parent reads end of file instead and fails, so no failure path has to
+ * remember to say anything.
+ *
+ * Returns 0 in the child, -1 on error. The parent never returns.
+ */
+static int go_background(uki_context_t *ctx) {
+    int fds[2];
+
+    if (pipe(fds) != 0) {
+	ERROR_LOG("Failed to create the startup pipe: %s", strerror(errno));
+	return -1;
+    }
+
+    pid_t pid = fork();
+
+    if (pid < 0) {
+	ERROR_LOG("Failed to fork: %s", strerror(errno));
+	close(fds[0]);
+	close(fds[1]);
+	return -1;
+    }
+
+    if (pid > 0) {
+	/* Parent: wait for the child to be serving, or to give up */
+	char status = 0;
+	close(fds[1]);
+	ssize_t n = read(fds[0], &status, 1);
+	close(fds[0]);
+	_exit((n == 1 && status == 'R') ? EXIT_SUCCESS : EXIT_FAILURE);
+    }
+
+    close(fds[0]);
+    ctx->ready_fd = fds[1];
+
+    return 0;
+}
+
+/*
+ * Let go of the terminal and tell the parent that the filesystem is up.
+ *
+ * Standard descriptors that the caller redirected to a file are left
+ * alone, so that 'ukifs -b -v ... > log' keeps logging; the others are
+ * replaced by /dev/null, as holding them would keep the shell, or an
+ * ssh session, waiting for a process that is meant to be detached.
+ */
+static void background_ready(uki_context_t *ctx) {
+    if (ctx->ready_fd < 0) {
+	return;
+    }
+
+    int devnull = open("/dev/null", O_RDWR);
+
+    for (int fd = STDIN_FILENO; fd <= STDERR_FILENO; fd++) {
+	struct stat st;
+
+	if (fstat(fd, &st) == 0 && S_ISREG(st.st_mode)) {
+	    continue;
+	}
+	if (devnull >= 0) {
+	    (void)dup2(devnull, fd);
+	}
+    }
+
+    if (devnull > STDERR_FILENO) {
+	close(devnull);
+    }
+
+    /* Detach from the controlling terminal and the session */
+    (void)procmgr_daemon(EXIT_SUCCESS, PROCMGR_DAEMON_NOCHDIR |
+				       PROCMGR_DAEMON_NOCLOSE |
+				       PROCMGR_DAEMON_NODEVNULL);
+
+    char status = 'R';
+    (void)!write(ctx->ready_fd, &status, 1);
+    close(ctx->ready_fd);
+    ctx->ready_fd = -1;
 }
 
 /*
@@ -549,6 +645,13 @@ int main(int argc, char *argv[]) {
         return EXIT_FAILURE;
     }
 
+    /* Detach early: a forked child would inherit neither the channel of
+     * the resource manager nor the threads of its pool */
+    if (ctx->background && go_background(ctx) != 0) {
+        free(ctx);
+        return EXIT_FAILURE;
+    }
+
     /* Shutdown request, from a signal or from umount */
     if (sem_init(&g_shutdown_sem, 0, 0) != 0) {
         ERROR_LOG("Failed to create the shutdown semaphore: %s", strerror(errno));
@@ -799,6 +902,9 @@ int main(int argc, char *argv[]) {
 
     INFO_LOG("UKI filesystem ready at %s", ctx->mount_point);
     DEBUG_LOG("=== UKIFS INITIALIZED SUCCESSFULLY ===");
+
+    /* Serving: the parent of a backgrounded run can exit successfully */
+    background_ready(ctx);
 
     /* The thread pool serves the requests. Wait until a signal or an
      * unmount asks for the filesystem to go away. */

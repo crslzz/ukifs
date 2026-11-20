@@ -50,6 +50,7 @@ slots](#ukiboot-ab-slots) below).
 -  `--bootctl <path>`       - Standalone `ukibootctl` partition to use for `--slot auto`
 -  `--no-mmap`              - Never map the UKI, always read it with `pread()`
 -  `--eager-map`            - Populate the mapping at mount instead of as the UKI is read
+-  `-b`, `--background`     - Detach once the filesystem is attached
 -  `-h`, `--help`           - Show this help
 
 ### Examples:
@@ -91,6 +92,25 @@ total 126228
 cat /mnt/uki/uname
 6.12.0-210.el10iv.aarch64
 ```
+
+### Running in the background
+
+`ukifs` runs in the foreground by default, so it is usually started with `&`.
+With `-b` it detaches instead, and does so only once the mountpoint is serving:
+
+```bash
+ukifs -b --slot auto /dev/sd0t131 /mnt/uki && qvm ...
+```
+
+The command returns when the filesystem is usable, and its status says whether
+mounting worked, which `&` cannot do: a failure there shows up as a `waitfor`
+timeout with no reason attached. A UKI that is missing, a slot that holds no
+UKI, or a signature that does not verify all come back as a non-zero status.
+
+Standard descriptors that were redirected to a file are kept, so
+`ukifs -b -v ... > /var/log/ukifs.log 2>&1` keeps logging after detaching; a
+terminal or a pipe is replaced by `/dev/null`, as holding it would keep the
+shell, or an ssh session, waiting for a process that is meant to be detached.
 
 ### Unmounting
 
