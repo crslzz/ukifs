@@ -40,6 +40,14 @@ typedef enum {
 #define UKI_SLOT_B_MBR_ID  0x47
 #define UKI_BOOTCTL_MBR_ID 0x48
 
+/*
+ * Name of the file holding the command line a ukiboot slot boots with,
+ * and the suffix ukiboot appends to it for each slot
+ */
+#define UKI_SLOT_CMDLINE_NAME "cmdline.ukiboot"
+#define UKI_SLOT_SUFFIX_A     " androidboot.slot_suffix=_a"
+#define UKI_SLOT_SUFFIX_B     " androidboot.slot_suffix=_b"
+
 /* Result of the slot lookup */
 typedef struct {
     int slot;           /* Selected slot: 0 = a, 1 = b */

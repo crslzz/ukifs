@@ -161,6 +161,28 @@ Both partitioning schemes defined by ukiboot are supported:
 ./ukifs --bootctl /dev/hd0t72 /dev/hd0 /mnt/uki
 ```
 
+### The command line of a slot
+
+ukiboot boots a slot by chain loading it as `ukiboot_a.efi` or `ukiboot_b.efi`,
+which makes the systemd stub load the matching addon and append
+`androidboot.slot_suffix=_a` or `_b` to the kernel command line. Nothing loads
+that addon when the UKI is mounted here, so `ukifs` synthesizes the result as
+an extra file next to the plain section:
+
+```bash
+$ ukifs --slot b /dev/sd0t131 /mnt/uki
+$ cat /mnt/uki/cmdline
+root=UUID=76a22bf4-f153-4541-b6c7-0332c0dfaeac rw loglevel=4
+$ cat /mnt/uki/cmdline.ukiboot
+root=UUID=76a22bf4-f153-4541-b6c7-0332c0dfaeac rw loglevel=4 androidboot.slot_suffix=_b
+```
+
+The suffix follows the slot that is mounted, whether it was forced with
+`--slot a`, `--slot b` or picked by `--slot auto`, and the content matches
+byte for byte what `ukibootimg extract cmdline` writes for the same slot. The
+file only exists when a slot is mounted: a plain UKI file has no slot, so it
+only has `cmdline`.
+
 ### Automatic slot selection
 
 With `--slot auto`, the active slot is computed from the `ukibootctl` content

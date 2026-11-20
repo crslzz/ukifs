@@ -37,6 +37,8 @@ typedef struct uki_entry {
     char *name;                    /* Sanitized name (e.g., "linux", "initrd") */
     uint32_t file_offset;          /* PointerToRawData from PE */
     uint32_t size;                 /* VirtualSize from PE */
+    char *data;                    /* Content of a synthesized file, NULL when
+                                      the file is a section of the UKI */
     mode_t mode;                   /* Always S_IFREG | 0444 (read-only) */
     time_t mtime;                  /* Modification time */
     struct uki_entry *next;        /* For hash table collision chaining */

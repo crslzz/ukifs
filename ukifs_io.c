@@ -445,6 +445,22 @@ int uki_read(resmgr_context_t *ctp, io_read_t *msg, RESMGR_OCB_T *ocb_base) {
               ocb->entry->name, ocb->entry->file_offset, (long)offset, nbytes,
               file_position, file_position + (uint32_t)nbytes - 1);
 
+    if (ocb->entry->data) {
+        /* Synthesized file: its content is held in memory for as long
+         * as the filesystem is mounted, so it can be handed over as is */
+        ocb->ocb.offset += nbytes;
+
+        if (ocb->ocb.attr) {
+            ocb->ocb.attr->flags |= IOFUNC_ATTR_ATIME;
+        }
+
+        _IO_SET_READ_NBYTES(ctp, nbytes);
+        SETIOV(ctp->iov, (void *)(ocb->entry->data + offset), nbytes);
+
+        DEBUG_EXIT(1);
+        return _RESMGR_NPARTS(1);
+    }
+
     if (!ctx->mmap_base) {
         /* No mapping (typically a block device): read the data from the
          * device and copy it to the client */
