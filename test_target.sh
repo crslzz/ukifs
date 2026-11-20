@@ -314,6 +314,12 @@ if start_ukifs --slot auto; then
 	    ok "a plain UKI file mounts without a slot"
 	    grep -e "Source:" -e "Mapped" $LOG
 
+	    if [ -f $MNT/cmdline.ukiboot ]; then
+		bad "a plain UKI file has a cmdline.ukiboot"
+	    else
+		ok "a plain UKI file has no cmdline.ukiboot"
+	    fi
+
 	    checksum_sections $SUMS.plain
 	    if [ "`cksum < $SUMS.mapped`" = "`cksum < $SUMS.plain`" ]; then
 		ok "the file and the slot serve identical data"
@@ -481,6 +487,42 @@ if [ -d $MNT ]; then
 else
     ok "nothing is left behind by a failed -b"
 fi
+
+echo
+echo "=== 13. Command line of the slot ==="
+#
+# A slot boots with androidboot.slot_suffix appended to its command
+# line, which ukifs serves as cmdline.ukiboot. A slot that holds no UKI
+# is skipped rather than failed: an image may have only one installed.
+#
+for slot in a b auto; do
+    if start_ukifs --slot $slot; then
+	case $slot in
+	    a)	  want="_a" ;;
+	    b)	  want="_b" ;;
+	    auto) want="_`grep 'Active ukiboot slot' $LOG | sed -e 's/.*slot: //'`" ;;
+	esac
+
+	if [ -f $MNT/cmdline.ukiboot ]; then
+	    expected="`cat $MNT/cmdline` androidboot.slot_suffix=$want"
+	    actual="`cat $MNT/cmdline.ukiboot`"
+
+	    if [ "$actual" = "$expected" ]; then
+		ok "slot $slot: cmdline.ukiboot is the cmdline plus $want"
+	    else
+		bad "slot $slot: cmdline.ukiboot is not what it should be"
+		echo "    want: $expected"
+		echo "    got:  $actual"
+	    fi
+	else
+	    bad "slot $slot: cmdline.ukiboot is missing"
+	fi
+
+	stop_ukifs
+    else
+	echo "slot $slot holds no UKI here, skipped"
+    fi
+done
 
 echo
 if [ $failures -ne 0 ]; then
