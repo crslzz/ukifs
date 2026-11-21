@@ -445,7 +445,22 @@ int uki_read(resmgr_context_t *ctp, io_read_t *msg, RESMGR_OCB_T *ocb_base) {
               ocb->entry->name, ocb->entry->file_offset, (long)offset, nbytes,
               file_position, file_position + (uint32_t)nbytes - 1);
 
-    if (ocb->entry->data) {
+    const char *content = ocb->entry->data;
+
+    if (!content && ocb->entry->zboot) {
+        /* Kernel of an EFI zboot image: decompressed on the first read
+         * of vmlinux, then served from memory like any synthesized file */
+        content = uki_zboot_image(ocb->entry->zboot);
+
+        if (!content) {
+            ERROR_LOG("[READ] file='%s' the kernel could not be unwrapped",
+                      ocb->entry->name);
+            DEBUG_EXIT(EIO);
+            return EIO;
+        }
+    }
+
+    if (content) {
         /* Synthesized file: its content is held in memory for as long
          * as the filesystem is mounted, so it can be handed over as is */
         ocb->ocb.offset += nbytes;
@@ -455,7 +470,7 @@ int uki_read(resmgr_context_t *ctp, io_read_t *msg, RESMGR_OCB_T *ocb_base) {
         }
 
         _IO_SET_READ_NBYTES(ctp, nbytes);
-        SETIOV(ctp->iov, (void *)(ocb->entry->data + offset), nbytes);
+        SETIOV(ctp->iov, (void *)(content + offset), nbytes);
 
         DEBUG_EXIT(1);
         return _RESMGR_NPARTS(1);

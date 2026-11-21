@@ -53,9 +53,19 @@ endif
 
 CFLAGS_WARN = -Wall -Wextra -Wpedantic -Wshadow #-Wconversion
 
+# ukiboot's utils.c defines a crc32() that takes a buffer and a length,
+# where zlib's takes a running checksum, a buffer and a length. Both end
+# up in a binary that decompresses an EFI zboot kernel, the one of
+# ukiboot wins at link time, and zlib's inflate() then calls it with a
+# checksum where it expects a pointer and faults. Renaming the ukiboot
+# one keeps the two apart; everything including utils.h or bootctl.h
+# has to be built with it.
+CFLAGS_UKIBOOT = -Dcrc32=ukiboot_crc32
+
 # Common compiler flags
 CFLAGS_COMMON = -O2 -g \
 		-D__QNXNTO__ -D_QNX_SOURCE -D__LITTLEENDIAN__ \
+		$(CFLAGS_UKIBOOT) \
 		-I. -I$(UKIBOOT) -I$(COMPAT) \
 		-I$(QNX_TARGET)/usr/include \
 
@@ -69,6 +79,9 @@ LDFLAGS = -L$(QNX_TARGET)/$(ARCH)/lib \
 # Libraries to link
 LIBS = -lssl -lcrypto
 
+# Unwrapping an EFI zboot kernel needs zlib
+LIBZ = -lz
+
 # Source files
 SRCS = ukifs_core.c \
        ukifs_parse.c \
@@ -77,6 +90,7 @@ SRCS = ukifs_core.c \
        ukifs_utils.c \
        ukifs_size.c \
        ukifs_slot.c \
+       ukifs_zboot.c \
        $(COMPAT)/ukifs_ssl.c \
        $(UKIBOOT)/pe_parser_posix.c \
        $(UKIBOOT)/gpt_parser.c \
@@ -94,6 +108,7 @@ HDRS = ukifs_core.h \
        ukifs_size.h \
        ukifs_slot.h \
        ukifs_utils.h \
+       ukifs_zboot.h \
        $(COMPAT)/config.h \
        $(COMPAT)/sys/endian.h \
        $(UKIBOOT)/bootctl.h \
@@ -123,7 +138,7 @@ banner:
 $(TARGET_BIN): $(OBJS)
 	@echo "Linking $@ for $(ARCH)..."
 	QNX_HOST=$(QNX_HOST) QNX_TARGET=$(QNX_TARGET) PATH=$(QNX_BIN):$$PATH \
-	    $(LD) $(LDFLAGS) -o $@ $(OBJS) $(LIBS)
+	    $(LD) $(LDFLAGS) -o $@ $(OBJS) $(LIBS) $(LIBZ)
 	@echo "Build complete: $@"
 
 # Compile
@@ -219,7 +234,7 @@ ukiextract: $(UKIEXTRACT_SRCS) \
 	@echo "Building the ukiboot UKI extraction utility..."
 	gcc -o ukiextract \
 	    $(UKIEXTRACT_SRCS) \
-	    -Wall -Wextra -O2 -g \
+	    -Wall -Wextra -O2 -g $(CFLAGS_UKIBOOT) \
 	    -I. -I$(UKIBOOT) -I$(COMPAT) \
 	    $(LIBS)
 	@echo "Build complete: ukiextract"
@@ -248,7 +263,7 @@ test_verify: test_verify.c \
 	    test_verify.c ukifs_size.c \
 	    $(UKIBOOT)/pe_parser_posix.c \
 	    $(UKIBOOT)/utils.c \
-	    -Wall -Wextra -O2 -g \
+	    -Wall -Wextra -O2 -g $(CFLAGS_UKIBOOT) \
 	     -I. -I$(UKIBOOT) -I$(COMPAT) \
 	    $(LIBS)
 	@echo "Build complete: test_verify"
@@ -266,7 +281,7 @@ test_size: test_size.c \
 	gcc -o test_size \
 	    test_size.c ukifs_size.c \
 	    $(UKIBOOT)/utils.c \
-	    -Wall -Wextra -O2 -g \
+	    -Wall -Wextra -O2 -g $(CFLAGS_UKIBOOT) \
 	    -I. -I$(UKIBOOT) -I$(COMPAT)
 	@echo "Build complete: test_size"
 
@@ -289,7 +304,8 @@ test_slot: test_slot.c \
 	    $(UKIBOOT)/gpt_parser.c \
 	    $(UKIBOOT)/pe_parser_posix.c \
 	    $(UKIBOOT)/utils.c \
-	    -Wall -Wextra -O2 -g \
+	    -Wall -Wextra -O2 -g $(CFLAGS_UKIBOOT) \
 	    -I. -I$(UKIBOOT) -I$(COMPAT) \
 	    $(LIBS)
 	@echo "Build complete: test_slot"
+

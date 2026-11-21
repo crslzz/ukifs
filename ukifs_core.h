@@ -18,6 +18,7 @@
 #include "ukifs_utils.h"
 #include "ukifs_dir.h"
 #include "ukifs_slot.h"
+#include "ukifs_zboot.h"
 
 
 /* Hash table size for path lookups */
@@ -39,6 +40,8 @@ typedef struct uki_entry {
     uint32_t size;                 /* VirtualSize from PE */
     char *data;                    /* Content of a synthesized file, NULL when
                                       the file is a section of the UKI */
+    uki_zboot_t *zboot;            /* Kernel to unwrap on the first read,
+                                      NULL for every other file */
     mode_t mode;                   /* Always S_IFREG | 0444 (read-only) */
     time_t mtime;                  /* Modification time */
     struct uki_entry *next;        /* For hash table collision chaining */
