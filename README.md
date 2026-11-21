@@ -22,6 +22,10 @@ UKIBOOT=/path/to/ukiboot QNX_SDP=/path/to/qnx/sdp make
 
 This creates `ukifs` (x86_64) and `ukifs.aarch64` executables for QNX.
 
+Besides OpenSSL, the driver links zlib, used to unwrap an [EFI zboot
+kernel](#efi-zboot-kernels-vmlinux). Both come with the QNX SDP, and a target
+image that can run `ukifs` already carries `libz.so.2` next to `libssl.so`.
+
 The companion Linux utility `ukiextract` (see [Extracting a UKI on
 Linux](#extracting-a-uki-on-linux-ukiextract)) is built for the host with:
 
@@ -271,6 +275,83 @@ $ ukifs -v --slot auto /dev/sd0t131 /mnt/uki
 [INFO] Attaching resource manager at /mnt/uki
 ```
 
+## EFI zboot kernels (vmlinux)
+
+The `.linux` section of a UKI is normally a bare kernel `Image`: on arm64 the
+PE/COFF headers of the EFI stub are overlaid on the boot header of the kernel,
+so the same bytes are both an EFI application and a kernel that a loader which
+is not EFI, such as `qvm`, can start. That is the case for the AutoSD images,
+and nothing extra is exposed for them.
+
+A kernel built with `CONFIG_EFI_ZBOOT` is a different thing: the section is a
+small EFI application carrying the real `Image` compressed in its payload,
+which the EFI stub decompresses at boot. Handed to `qvm` as it is, it does not
+boot. `ukifs` recognizes such a kernel and serves the `Image` unwrapped from
+it as an extra `vmlinux` file:
+
+```bash
+$ ukifs -v --slot auto /dev/sd0t131 /mnt/uki
+[INFO] The kernel is an EFI zboot image (gzip, 13852062 bytes compressed, 55246848 bytes once unwrapped)
+[INFO] Added vmlinux, the kernel unwrapped from the EFI zboot image (55246848 bytes)
+$ ls -l /mnt/uki/linux /mnt/uki/vmlinux
+-r--r--r--  1 root  root  13914624 ... linux
+-r--r--r--  1 root  root  55246848 ... vmlinux
+$ file linux vmlinux
+linux:   Linux kernel ARM64 EFI executable gzip compressed zboot Image
+vmlinux: Linux kernel ARM64 boot executable Image, little-endian, 4K pages
+```
+
+- `linux` keeps serving the section as it is, container and all.
+- `vmlinux` is the kernel the EFI stub would have produced: the `Image` padded
+  with zeroes to the in-memory size its boot header announces, which is what
+  the kernel build compressed in the first place.
+- The file appears only when there is something to unwrap. A bare `Image`
+  gets no `vmlinux`, as it would be a second name for `linux`.
+- The kernel is decompressed when `vmlinux` is first read, not while mounting:
+  a client that only reads `cmdline` or `uname` does not pay for it. Once
+  decompressed it stays in memory until the filesystem is unmounted, so a
+  mount whose `vmlinux` has been read holds the whole kernel in RAM.
+
+### Why `vmlinux` and not `vmlinuz`
+
+`arch/arm64/boot/install.sh` picks between the two names by exactly this
+criterion: `Image.gz` and `vmlinuz.efi` are installed as `vmlinuz`, anything
+else as `vmlinux`. What is served here is the uncompressed `Image`, so it is a
+`vmlinux`.
+
+Using `vmlinuz` would also give one name to two different things. RHEL builds
+aarch64 with `CONFIG_COMPRESSED_INSTALL=y`, which makes `KBUILD_IMAGE` the
+`vmlinuz.efi` of the zboot build, so the `/boot/vmlinuz-<version>` of such a
+system *is* the container — the same object `linux` already serves here. The
+kernel's own chain is `Image` → padded → `vmlinux.bin` → gzip → `vmlinuz` →
+wrapped → `vmlinuz.efi`; this file is that `vmlinux.bin`, and the `vmlinuz`
+of that chain is the gzip stream inside `linux`.
+
+The one thing the name does not mean here is the unstripped ELF with symbols
+that a kernel build leaves at its top level. This is a raw `Image`, with no
+ELF header and no symbol table.
+
+Only gzip is handled, which is what the kernel uses by default. A kernel
+compressed with zstd is reported and left alone, as QNX has no zstd library
+to decompress it with:
+
+```
+[ERROR] Warning: the kernel is an EFI zboot image compressed with 'zstd',
+        which this build cannot decompress, so no vmlinux is exposed
+```
+
+Measured on an i.MX8QXP, mounting the active slot of that image from
+`/dev/sd0t131` and unwrapping its 55246848 byte kernel from the 13852062 byte
+gzip payload takes **1.92 s** (median of three runs: 1917, 1920, 1916 ms).
+Mounting itself stays at 0.45 s, the same as for a UKI with a bare kernel,
+when nothing reads `vmlinux`.
+
+To boot such a kernel, point the loader at `vmlinux` instead of `linux`:
+
+```
+load $env{UKIFS_DIR}/vmlinux
+```
+
 ## How the UKI is read
 
 Reads are served with as few copies as the resource manager interface allows,
@@ -398,9 +479,26 @@ Host test programs are built with `make tests`; see [TESTING.md](TESTING.md).
 The ukiboot slot support can be exercised on Linux with:
 
 ```bash
-make test-slot utils
+make test-slot test-zboot utils
 ./test_slot_demo.sh      # builds GPT and MBR ukiboot images, resolves the slots,
                          # and checks that ukiextract gives the UKIs back byte for byte
+./test_zboot_demo.sh     # builds UKIs around an EFI zboot kernel and checks that
+                         # what is unwrapped is the kernel that was wrapped
 sudo ./test_blkdev.sh    # puts a ukiboot image in a partition of a loop device
                          # and reads it back through the block device
+```
+
+`test_target.sh` runs the whole thing on a QNX target. Give it a UKI with an
+EFI zboot kernel to cover `vmlinux` there as well, which the kernel of a
+target image, being a bare `Image`, cannot:
+
+```bash
+# on the host
+./test_zboot_demo.sh /tmp/out        # writes zboot_uki.efi and its checksum
+scp ukifs.aarch64 test_target.sh /tmp/out/zboot_uki.efi \
+    /tmp/out/zboot_uki.vmlinux.cksum root@target:/data/
+
+# on the target
+DEV=/dev/sd0t131 ZBOOT_UKI=/data/zboot_uki.efi \
+    ZBOOT_CKSUM=/data/zboot_uki.vmlinux.cksum sh /data/test_target.sh
 ```
