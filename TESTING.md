@@ -98,6 +98,43 @@ Section                Offset         Size   Image offset
 .initrd                  3072           17        2100224
 ```
 
+### 4. test_zboot - EFI zboot Kernel Unwrapping
+
+Reports whether the kernel section of a UKI is an EFI zboot image and, when it
+is, unwraps the kernel from it with the same code `ukifs` uses to serve
+`vmlinux`.
+
+```bash
+./test_zboot [options] <uki-file|ukiboot-image>
+```
+
+**Options:**
+- `-s <a|b|auto>`, `-A`, `-B` - Read the UKI from a ukiboot slot
+- `--bootctl <path>` - Standalone `ukibootctl` partition to use
+- `-o <path>` - Write the unwrapped kernel there (`-` for stdout)
+- `-d <level>` - Debug level: 0=quiet, 1=errors, 2=info, 3=debug
+- `-h` - Show help
+
+**Exit status:** 0 when a kernel was unwrapped, 1 on error, 2 when there is
+nothing to unwrap (a bare `Image`, or a container this build cannot handle).
+
+**Example:**
+```bash
+$ ./test_zboot --slot auto autosd10-ebbr-minimal-image-efi.img
+UKI:            autosd10-ebbr-minimal-image-efi.img
+UKI offset:     105906176 bytes
+Kernel section: linux, offset 105985536, 13914624 bytes
+
+EFI zboot:      yes
+Compression:    gzip
+Payload:        offset 106034464, 13852062 bytes
+vmlinux:        55246848 bytes
+Unwrapped:      an arm64 Image
+
+$ ./test_zboot --slot auto autosd10-ebbr-signed.img
+EFI zboot:      no, nothing to unwrap
+```
+
 ## Building
 
 Build all test programs:
@@ -112,6 +149,7 @@ Build individually:
 UKIBOOT=/path/to/ukiboot QNX_SDP=/path/to/qnx/sdp make test-size    # UKI size analysis
 UKIBOOT=/path/to/ukiboot QNX_SDP=/path/to/qnx/sdp make test-verify  # Signature verification
 UKIBOOT=/path/to/ukiboot QNX_SDP=/path/to/qnx/sdp make test-slot    # ukiboot slot selection
+UKIBOOT=/path/to/ukiboot QNX_SDP=/path/to/qnx/sdp make test-zboot   # EFI zboot kernel
 ```
 
 ## Running Tests
@@ -128,6 +166,10 @@ UKIBOOT=/path/to/ukiboot QNX_SDP=/path/to/qnx/sdp make test-slot    # ukiboot sl
 # ukiboot slot selection
 ./test_slot ukiboot.img auto
 ./test_slot ukiboot.img a
+
+# EFI zboot kernel
+./test_zboot --slot auto ukiboot.img
+./test_zboot -o vmlinux uki.efi
 ```
 
 ### Demo Scripts
@@ -136,6 +178,10 @@ UKIBOOT=/path/to/ukiboot QNX_SDP=/path/to/qnx/sdp make test-slot    # ukiboot sl
 ./test_verify_demo.sh       # Demonstrates signature verification
 ./test_slot_demo.sh         # Builds GPT and MBR ukiboot images, resolves their slots,
                             # and round-trips the UKIs through ukiextract
+./test_zboot_demo.sh        # Builds UKIs around an EFI zboot kernel and checks that
+                            # what is unwrapped is the kernel that was wrapped
+./test_zboot_demo.sh <dir>  # Same, keeping the UKI and the checksum of its vmlinux
+                            # for test_target.sh to use on a QNX target
 sudo ./test_blkdev.sh       # Same, with the ukiboot image in a partition of a
                             # loop device, read through the block device
 ./test_comprehensive.sh     # Runs all tests
@@ -375,6 +421,10 @@ If padding is added after signing, it's not included in the signature hash.
 
 - `test_size.c` - Size analysis program
 - `test_verify.c` - Signature verification program
+- `test_slot.c` - ukiboot slot selection program
+- `test_zboot.c` - EFI zboot kernel unwrapping program
+- `test_images.sh` - Helpers building test UKIs, kernels and ukiboot images
+- `test_zboot_demo.sh` - EFI zboot unwrapping demo and checks
 - `uki_size.c` / `uki_size.h` - Common size computation library
 - `config_linux.h` - Linux build configuration
 - `test_size_demo.sh` - Size analysis demo
@@ -388,16 +438,17 @@ If padding is added after signing, it's not included in the signature hash.
 
 - GCC or Clang
 - OpenSSL development libraries (`libssl-dev` or `openssl-devel`)
+- zlib development libraries (`zlib-devel` or `zlib1g-dev`), for test_zboot
 - Linux x86_64 system
 
 Install on Fedora/RHEL:
 ```bash
-sudo dnf install openssl-devel gcc
+sudo dnf install openssl-devel zlib-devel gcc
 ```
 
 Install on Debian/Ubuntu:
 ```bash
-sudo apt install libssl-dev gcc
+sudo apt install libssl-dev zlib1g-dev gcc
 ```
 
 ## See Also

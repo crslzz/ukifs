@@ -16,6 +16,12 @@
 #   UKIFS  path to the ukifs binary       (default /tmp/ukifs)
 #   DEV    ukiboot image to mount         (default /dev/sd0t131)
 #   MNT    mountpoint to attach           (default /mnt/uki)
+#   ZBOOT_UKI     UKI with an EFI zboot kernel, to check vmlinux
+#   ZBOOT_CKSUM   file holding the expected 'cksum' of its vmlinux
+#
+# ZBOOT_UKI and ZBOOT_CKSUM are written by test_zboot_demo.sh on the
+# host: ./test_zboot_demo.sh /tmp/out, then copy zboot_uki.efi and
+# zboot_uki.vmlinux.cksum to the target.
 #
 # Note: on QNX the utilities live in /proc/boot, and a binary cannot be
 # executed from a DOS filesystem, so keep ukifs on /tmp. The script only
@@ -523,6 +529,137 @@ for slot in a b auto; do
 	echo "slot $slot holds no UKI here, skipped"
     fi
 done
+
+echo
+echo "=== 14. EFI zboot kernel ==="
+#
+# A kernel built with CONFIG_EFI_ZBOOT is an EFI application carrying a
+# compressed Image, which only an EFI firmware can boot. ukifs unwraps
+# it into vmlinux, next to the linux section it comes from.
+#
+# The kernel of the image of a target is usually a bare Image, which is
+# left alone; that negative case is checked here, but on its own it
+# would pass whatever the driver does, so the unwrapping itself is only
+# claimed when a UKI built by test_zboot_demo.sh is provided.
+#
+if start_ukifs --slot auto; then
+    if grep "nothing to unwrap" $LOG > /dev/null 2>&1; then
+	ok "the kernel of $DEV is a bare Image, left alone"
+
+	if [ -f $MNT/vmlinux ]; then
+	    bad "a bare Image was still exposed as vmlinux"
+	else
+	    ok "no vmlinux for a kernel that needs none"
+	fi
+    elif grep "EFI zboot image" $LOG > /dev/null 2>&1; then
+	ok "the kernel of $DEV is an EFI zboot image"
+
+	if [ -f $MNT/vmlinux ]; then
+	    ok "it is exposed as vmlinux"
+	else
+	    bad "it is not exposed as vmlinux"
+	fi
+    else
+	bad "the kernel of $DEV was not examined at all"
+	grep -e "kernel" -e "linux" $LOG
+    fi
+
+    stop_ukifs
+else
+    bad "the slot did not mount for the EFI zboot check"
+fi
+
+ZBOOT_UKI=${ZBOOT_UKI:-/data/zboot_uki.efi}
+ZBOOT_CKSUM=${ZBOOT_CKSUM:-/data/zboot_uki.vmlinux.cksum}
+
+if [ -f "$ZBOOT_UKI" ]; then
+    if start_ukifs_src $ZBOOT_UKI; then
+	ok "a UKI with an EFI zboot kernel mounts"
+	grep -e "zboot" $LOG
+
+	if [ -f $MNT/vmlinux ]; then
+	    ok "vmlinux is there"
+	else
+	    bad "vmlinux is missing"
+	    ls -l $MNT
+	fi
+
+	# The section it comes from is served untouched, container and all
+	wrapper=`dd if=$MNT/linux bs=1 skip=4 count=4 2>/dev/null`
+	if [ "$wrapper" = "zimg" ]; then
+	    ok "linux still serves the EFI zboot container"
+	else
+	    bad "linux does not serve the EFI zboot container ('$wrapper')"
+	fi
+
+	# An arm64 Image carries ARMd at offset 56; the container does not
+	magic=`dd if=$MNT/vmlinux bs=1 skip=56 count=4 2>/dev/null`
+	if [ "$magic" = "ARMd" ]; then
+	    ok "vmlinux is an arm64 Image"
+	else
+	    bad "vmlinux is not an arm64 Image ('$magic')"
+	fi
+
+	zboot_sum=`cksum < $MNT/vmlinux`
+	echo "vmlinux: $zboot_sum"
+
+	# Every comparison below is vacuous if the read failed outright
+	if [ -n "$zboot_sum" ]; then
+	    ok "vmlinux can be read"
+	else
+	    bad "vmlinux could not be read"
+	    grep ERROR $LOG
+	fi
+
+	if [ -f "$ZBOOT_CKSUM" ]; then
+	    # Keep the checksum and the length only: cksum here pads them
+	    # and adds the name of the stream, the host one does neither
+	    set -- $zboot_sum
+	    got="$1 $2"
+	    set -- `cat $ZBOOT_CKSUM`
+	    want="$1 $2"
+
+	    if [ "$got" = "$want" ]; then
+		ok "vmlinux is exactly the kernel that was wrapped"
+	    else
+		bad "vmlinux is not the kernel that was wrapped"
+		echo "    want: $want"
+		echo "    got:  $got"
+	    fi
+	else
+	    echo "no $ZBOOT_CKSUM, the content of vmlinux is not checked"
+	fi
+
+	# Reading from an offset goes through the same buffer
+	head_sum=`dd if=$MNT/vmlinux bs=512 count=64 2>/dev/null | cksum`
+	tail_sum=`dd if=$MNT/vmlinux bs=512 skip=64 count=64 2>/dev/null | cksum`
+	if [ "$head_sum" != "$tail_sum" ]; then
+	    ok "seeking reads of vmlinux return different data"
+	else
+	    bad "two different parts of vmlinux read the same"
+	fi
+
+	stop_ukifs
+
+	# The kernel is decompressed in memory, so --no-mmap must serve
+	# exactly the same bytes as the mapped run
+	if start_ukifs_src $ZBOOT_UKI --no-mmap; then
+	    pread_sum=`cksum < $MNT/vmlinux`
+	    if [ -n "$pread_sum" ] && [ "$pread_sum" = "$zboot_sum" ]; then
+		ok "vmlinux is identical with --no-mmap"
+	    else
+		bad "vmlinux differs with --no-mmap"
+	    fi
+	    stop_ukifs
+	else
+	    bad "the zboot UKI did not mount with --no-mmap"
+	fi
+    else
+	bad "a UKI with an EFI zboot kernel did not mount"
+    fi
+else
+    echo "no $ZBOOT_UKI here, the unwrapping itself is not covered"
+fi
 
 echo
 if [ $failures -ne 0 ]; then

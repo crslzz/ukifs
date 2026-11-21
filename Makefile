@@ -241,11 +241,11 @@ ukiextract: $(UKIEXTRACT_SRCS) \
 
 # Host test programs
 .PHONY: tests
-tests: test-verify test-size test-slot
+tests: test-verify test-size test-slot test-zboot
 	@echo "All test programs built"
 
 clean-tests:
-	rm -f test_verify test_size test_slot
+	rm -f test_verify test_size test_slot test_zboot
 
 .PHONY: test-verify
 test-verify: test_verify
@@ -309,3 +309,27 @@ test_slot: test_slot.c \
 	    $(LIBS)
 	@echo "Build complete: test_slot"
 
+.PHONY: test-zboot
+test-zboot: test_zboot
+	@echo "Test program built: test_zboot"
+	@echo "Usage: ./test_zboot [--slot a|b|auto] [-o vmlinuz] <uki-file|image>"
+
+test_zboot: test_zboot.c \
+	    ukifs_zboot.c ukifs_zboot.h \
+	    ukifs_slot.c ukifs_slot.h \
+	    ukifs_size.c ukifs_size.h \
+	    ukifs_utils.h ukifs_pe.h \
+	    $(UKIBOOT)/gpt_parser.c $(UKIBOOT)/gpt_parser.h \
+	    $(UKIBOOT)/bootctl.h \
+	    $(UKIBOOT)/pe_parser_posix.c $(UKIBOOT)/pe_parser_posix.h \
+	    $(UKIBOOT)/utils.c $(UKIBOOT)/utils.h $(COMPAT)/config.h
+	@echo "Building the EFI zboot kernel test..."
+	gcc -o test_zboot \
+	    test_zboot.c ukifs_zboot.c ukifs_slot.c ukifs_size.c \
+	    $(UKIBOOT)/gpt_parser.c \
+	    $(UKIBOOT)/pe_parser_posix.c \
+	    $(UKIBOOT)/utils.c \
+	    -Wall -Wextra -O2 -g $(CFLAGS_UKIBOOT) \
+	    -I. -I$(UKIBOOT) -I$(COMPAT) \
+	    $(LIBS) $(LIBZ)
+	@echo "Build complete: test_zboot"
